@@ -26,6 +26,7 @@ import concurrent.futures
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -321,24 +322,102 @@ def _probe(host: str) -> HostResult:
     try:
         result = ssh_exec(host, "true", timeout=60)
     except LabError as exc:
-        return HostResult(host, False, detail=str(exc))
+        return HostResult(host, False, detail=str(exc),
+                          duration=time.monotonic() - started)
     except subprocess.TimeoutExpired:
-        return HostResult(host, False, detail="timeout")
+        return HostResult(host, False, detail="timeout",
+                          duration=time.monotonic() - started)
     elapsed = time.monotonic() - started
+    ok = result.returncode == 0
+    # Full streams are preserved so a failure can be diagnosed without re-running
+    # the probe; `detail` carries only the actionable line.
     return HostResult(
         host,
-        result.returncode == 0,
-        detail="ok" if result.returncode == 0 else (result.stderr or "").strip()[:200],
+        ok,
+        detail="ok" if ok else _describe_failure(result),
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
         exit_code=result.returncode,
         duration=elapsed,
     )
+
+
+# Docker Compose writes lifecycle chatter to stderr on the same channel as the
+# remote stderr. These patterns match that chatter only; they must never be
+# reported as an SSH or authentication error.
+_COMPOSE_NOISE = re.compile(
+    r"^\s*("
+    r"Container\s+\S+\s+(Creating|Created|Starting|Started|Recreating|Recreated"
+    r"|Stopping|Stopped|Removing|Removed|Running|Waiting|Healthy|Error)"
+    r"|Network\s+\S+\s+(Creating|Created|Removing|Removed)"
+    r"|Volume\s+\S+\s+(Creating|Created|Removing|Removed)"
+    r"|time=\"[^\"]*\"\s+level=\w+"
+    r")"
+)
+
+
+def _strip_compose_noise(text: str) -> str:
+    """Drop `docker compose` lifecycle lines, keeping genuine remote output."""
+    return "\n".join(
+        line for line in (text or "").splitlines()
+        if not _COMPOSE_NOISE.match(line)
+    ).strip()
+
+
+def _diagnostics(result: subprocess.CompletedProcess[str]) -> str:
+    """Remote stderr if the remote said anything, otherwise the remote stdout.
+
+    Compose lifecycle chatter is removed first, so it can never be mistaken for
+    an SSH failure. The fallback to stdout covers entrypoint errors that exit
+    non-zero without writing to stderr.
+    """
+    stderr = _strip_compose_noise(result.stderr or "")
+    if stderr:
+        return stderr
+    return _strip_compose_noise(result.stdout or "")
+
+
+def _describe_failure(result: subprocess.CompletedProcess[str]) -> str:
+    """One actionable line for the results table, full text in HostResult."""
+    first = next(
+        (line.strip() for line in _diagnostics(result).splitlines() if line.strip()),
+        "",
+    )
+    if not first:
+        return (
+            f"no diagnostic output (exit {result.returncode}); "
+            "re-run with `python scripts/lab.py health`"
+        )
+    return first
+
+
+def _print_failure_diagnostics(results: list[HostResult]) -> None:
+    """Print every failing host's complete remote stdout and stderr."""
+    failed = [r for r in results if not r.ok]
+    if not failed:
+        return
+    print("\nfailure diagnostics (complete, unfiltered streams except compose "
+          "lifecycle lines):")
+    for r in failed:
+        print(f"\n--- {r.host} exit={r.exit_code} "
+              f"stdout={len(r.stdout)}B stderr={len(r.stderr)}B ---")
+        if r.stdout.strip():
+            print("[stdout]")
+            print(r.stdout.rstrip())
+        if r.stderr.strip():
+            print("[stderr]")
+            print(r.stderr.rstrip())
+        if not r.stdout.strip() and not r.stderr.strip():
+            print("(no output on either stream)")
 
 
 def cmd_verify_auth(args: argparse.Namespace) -> int:
     require_docker()
     results = _parallel(ALL_HOSTS, _probe, workers=args.workers)
     failures = [r for r in results if not r.ok]
-    _print_results(sorted(results, key=lambda r: r.host))
+    ordered = sorted(results, key=lambda r: r.host)
+    _print_results(ordered)
+    _print_failure_diagnostics(ordered)
     print(f"\npublic-key auth: {len(results) - len(failures)}/{len(results)} hosts OK")
     return 0 if not failures else 1
 
@@ -411,8 +490,10 @@ def _print_results(results: list[HostResult]) -> None:
     print(f"{'HOST':<14} {'RESULT':<8} {'EXIT':<6} {'TIME':<8} DETAIL")
     print("-" * 78)
     for r in results:
+        # The summary is not truncated: a cut-off OpenSSH message is what made
+        # the earlier transport confusion hard to diagnose.
         print(f"{r.host:<14} {'OK' if r.ok else 'FAIL':<8} "
-              f"{str(r.exit_code):<6} {r.duration:<8.2f} {r.detail[:32]}")
+              f"{str(r.exit_code):<6} {r.duration:<8.2f} {r.detail}")
 
 
 # --------------------------------------------------------------------------- #

@@ -215,3 +215,7 @@ rebuild of a table carrying triggers must do the same.
 - `manage.py`-style scripts are unnecessary; invoke uvicorn/alembic directly.
 - Redirect long-running server output to a file when backgrounding, otherwise the
   process can die with the parent shell.
+- `SSHSUITE_DATA_DIR` / `SSHSUITE_LOG_DIR` left over in the shell override the
+  defaults, and because the app creates those directories on start, a stale
+  value silently recreates a deleted path instead of failing. Clear them (or
+  check `GET /api/health` -> `paths`) before blaming the code.

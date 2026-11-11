@@ -131,10 +131,10 @@ export function DashboardPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Next up</CardTitle>
+              <CardTitle className="text-base">Areas</CardTitle>
               <CardDescription>
-                Milestone 1 established the foundation. These areas are not
-                implemented yet.
+                What each area does today. Scheduling is the only part still
+                outstanding.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -146,14 +146,21 @@ export function DashboardPage() {
                       className="hover:bg-accent/60 -mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-2.5 transition-colors"
                     >
                       <span className="flex items-center gap-3">
-                        <item.icon aria-hidden="true" className="text-muted-foreground size-4" />
+                        <item.icon
+                          aria-hidden="true"
+                          className="text-muted-foreground size-4"
+                        />
                         <span className="text-sm font-medium">{item.label}</span>
                       </span>
-                      <Badge variant="secondary">Planned</Badge>
+                      <Badge variant="success">Ready</Badge>
                     </Link>
                   </li>
                 ))}
               </ul>
+              <p className="text-muted-foreground mt-3 text-xs">
+                Scheduled runs (APScheduler) are not enabled yet. Everything else —
+                credentials, templates, workflows and run history — is usable now.
+              </p>
             </CardContent>
           </Card>
         </div>

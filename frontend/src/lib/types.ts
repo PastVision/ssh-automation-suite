@@ -282,3 +282,209 @@ export interface TemplateUpdate {
   /** Optimistic concurrency: the row_version the editor loaded. */
   row_version: number
 }
+/* -------------------------------------------------------------------------- */
+/* SSH credentials                                                             */
+/* -------------------------------------------------------------------------- */
+/**
+ * A credential as the API returns it. There is no private-key field by design:
+ * the backend never serialises key material, so this type cannot represent it.
+ */
+export interface Credential {
+  id: number
+  name: string
+  username: string
+  description: string | null
+  default_port: number
+  private_key_fingerprint: string | null
+  private_key_type: string | null
+  private_key_comment: string | null
+  has_private_key: boolean
+  created_at: string
+  updated_at: string
+}
+export interface CredentialListResponse {
+  items: Credential[]
+}
+export interface CredentialCreate {
+  name: string
+  username: string
+  description?: string | null
+  default_port: number
+  private_key: string
+}
+/** The 409 detail returned when a credential is still referenced. */
+export interface CredentialDeleteBlocked {
+  message: string
+  workflows: number
+  active_executions: number
+}
+/* -------------------------------------------------------------------------- */
+/* Workflows                                                                   */
+/* -------------------------------------------------------------------------- */
+/** Mirrors `RunAsMethod`: how the target user is reached via sudo. */
+export type RunAsMethod = 'nopasswd' | 'password'
+
+/** One entry of a workflow body. Position is array order, not a field. */
+export interface WorkflowTemplateEntry {
+  kind: 'template'
+  position: number
+  template_id: number
+  template_name: string
+  template_version: number
+}
+/**
+ * A Run-As block. `has_password` reports *state* only: the password is
+ * write-only, so no response type can carry it.
+ */
+export interface WorkflowRunAsEntry {
+  kind: 'run_as'
+  position: number
+  target_username: string
+  method: RunAsMethod
+  has_password: boolean
+}
+export type WorkflowEntry = WorkflowTemplateEntry | WorkflowRunAsEntry
+
+export interface WorkflowVariable {
+  name: string
+  discovery_command: string
+  description: string | null
+  timeout_seconds: number
+}
+export interface WorkflowHost {
+  hostname: string
+  port: number | null
+}
+
+export interface WorkflowSummary {
+  id: number
+  name: string
+  description: string | null
+  owner_id: number
+  row_version: number
+  can_edit: boolean
+  is_owner: boolean
+  step_count: number
+  run_as_count: number
+  variable_count: number
+  host_count: number
+  created_at: string
+  updated_at: string
+}
+export interface WorkflowDetail extends WorkflowSummary {
+  credential_id: number | null
+  entries: WorkflowEntry[]
+  variables: WorkflowVariable[]
+  hosts: WorkflowHost[]
+}
+export interface WorkflowListResponse {
+  items: WorkflowSummary[]
+}
+
+export interface WorkflowTemplateStepInput {
+  kind: 'template'
+  template_id: number
+}
+export interface WorkflowRunAsInput {
+  kind: 'run_as'
+  target_username: string
+  method: RunAsMethod
+  /** Write-only. Omitted when editing a block whose password is already stored. */
+  password?: string | null
+}
+export type WorkflowEntryInput = WorkflowTemplateStepInput | WorkflowRunAsInput
+
+export interface WorkflowCreate {
+  name: string
+  description?: string | null
+  credential_id?: number | null
+  entries: WorkflowEntryInput[]
+  variables: WorkflowVariable[]
+  hosts: WorkflowHost[]
+}
+export interface WorkflowUpdate extends WorkflowCreate {
+  /** Optimistic concurrency: the row_version the editor loaded. */
+  row_version: number
+}
+
+export interface WorkflowRunResponse {
+  execution_id: number
+}
+
+/* -------------------------------------------------------------------------- */
+/* Executions                                                                  */
+/* -------------------------------------------------------------------------- */
+export type ExecutionStatus =
+  | 'pending'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+export type HostRunStatus =
+  | 'pending'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled'
+export type StepRunStatus =
+  | 'pending'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled'
+export interface StepRun {
+  position: number
+  template_name: string
+  status: StepRunStatus
+  exit_code: number | null
+  duration_ms: number | null
+  started_at: string | null
+  finished_at: string | null
+}
+export interface HostRun {
+  id: number
+  hostname: string
+  port: number
+  credential_name: string | null
+  status: HostRunStatus
+  failed_step_position: number | null
+  error_message: string | null
+  started_at: string | null
+  finished_at: string | null
+  log_path: string | null
+  steps: StepRun[]
+}
+export interface ExecutionSummary {
+  id: number
+  workflow_id: number | null
+  workflow_name: string
+  status: ExecutionStatus
+  trigger: string
+  host_count: number
+  succeeded_host_count: number
+  failed_host_count: number
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+}
+export interface ExecutionListResponse {
+  items: ExecutionSummary[]
+  total: number
+}
+export interface ExecutionDetail extends ExecutionSummary {
+  log_path: string | null
+  error_message: string | null
+  hosts: HostRun[]
+}
+
+/** One host run's filesystem transcript. `content` is empty when unavailable. */
+export interface HostTranscript {
+  execution_id: number
+  host_run_id: number
+  hostname: string
+  available: boolean
+  truncated: boolean
+  content: string
+}

@@ -4,11 +4,11 @@ Run reusable shell-script templates over SSH across many hosts, from a small
 self-hosted web UI. No Redis, no Celery, no Kubernetes — one FastAPI process, a
 SQLite file, and logs on disk.
 
-> **Status: Milestone 1 — foundation only.**
-> This milestone establishes the project skeleton, data model, configuration and
-> a working dashboard. SSH execution, template editing and workflow
-> orchestration are intentionally **not** implemented yet. See
-> [Roadmap](#roadmap).
+> **Status: Milestones 1–3 and 6 complete.**
+> Credentials, versioned templates, workflows, the SSH execution engine and
+> end-to-end workflow authoring in the browser all work against the local Docker
+> SSH lab. Still missing: WebSocket log streaming (the UI polls over HTTP) and
+> APScheduler-based scheduling. See [Roadmap](#roadmap).
 
 ---
 
@@ -365,9 +365,9 @@ isolation, the global concurrency ceiling, cancellation, and shutdown.
 | **1 (done)** | Foundation: structure, config, SQLite + migrations, health endpoint, dashboard shell |
 | **2 (done)** | SSH credentials, versioned templates, workflows, execution history, log store, SSH test lab |
 | **3 (done)** | SSH execution engine: 20-host concurrency, sequential steps, fail-fast per host, cancellation, shutdown |
-| 4 | Execution history UI, filesystem log viewer, WebSockets |
+| 4 (partial) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming: **not implemented**, the UI polls over HTTP |
 | 5 | APScheduler scheduling |
-| 6 | End-to-end workflow authoring in the UI |
+| **6 (done)** | End-to-end workflow authoring in the UI: editor, host list, variables, run monitor, execution detail |
 
 ---
 

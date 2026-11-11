@@ -45,8 +45,10 @@ def test_openapi_exposes_only_the_intended_surface(client: TestClient) -> None:
     """Pin the public API surface.
 
     This is a guard, not a formality: it fails when a route appears that nobody
-    intended. Workflow CRUD is present as of the workflow-manager milestone;
-    SSH execution, scheduling and host-list management remain separate surfaces.
+    intended. Workflow CRUD, minimal SSH credential management (create/list/delete,
+    the minimum needed to run a workflow), execution history and host transcripts
+    are present as of the workflow-manager milestone. Scheduling, credential
+    sharing and bulk host-list management remain separate surfaces.
     """
     assert sorted(client.get("/openapi.json").json()["paths"]) == [
         "/api/audit",
@@ -56,9 +58,12 @@ def test_openapi_exposes_only_the_intended_surface(client: TestClient) -> None:
         "/api/auth/sessions",
         "/api/auth/sessions/{session_id}",
         "/api/auth/status",
+        "/api/credentials",
+        "/api/credentials/{credential_id}",
         "/api/executions",
         "/api/executions/{execution_id}",
         "/api/executions/{execution_id}/cancel",
+        "/api/executions/{execution_id}/hosts/{host_run_id}/transcript",
         "/api/health",
         "/api/locks/{resource_type}/{resource_id}",
         "/api/locks/{resource_type}/{resource_id}/renew",

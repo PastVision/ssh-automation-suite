@@ -1,7 +1,8 @@
 """Execution endpoints.
 
-Three routes only: start, read, cancel. This is the smallest surface that makes
-the engine exerciseable and observable.
+Routes: start, list, read, host transcript, cancel. ``get_log_store`` is read
+here so a run's filesystem transcript can be viewed from the UI; the bytes stay
+on disk and SQLite keeps only metadata.
 
 Every route requires an authenticated actor and is scoped to executions that actor
 created. An execution is SSH work against real hosts: letting another user read
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 
 from app.core.config import get_settings
@@ -24,12 +25,16 @@ from app.schemas.execution import (
     CancelResponse,
     ExecutionAccepted,
     ExecutionCreate,
+    ExecutionListResponse,
     ExecutionRead,
+    ExecutionSummary,
+    HostTranscriptRead,
     HostRunRead,
     StepRunRead,
 )
 from app.services import audit, execution_state, sessions
 from app.services.execution_state import HostSpec, StepSpec
+from app.services.log_store import get_log_store
 from app.services.identity import client_ip, require_principal
 
 logger = logging.getLogger(__name__)
@@ -176,6 +181,48 @@ async def start_execution(
     return ExecutionAccepted(id=execution_id, status=ExecutionStatus.PENDING)
 
 
+@router.get(
+    "",
+    response_model=ExecutionListResponse,
+    summary="My execution history, newest first",
+)
+def list_executions(
+    status_filter: ExecutionStatus | None = Query(
+        default=None, alias="status", description="Only runs in this state"
+    ),
+    workflow_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: sessions.Principal = Depends(require_principal),
+) -> ExecutionListResponse:
+    rows, total = execution_state.list_executions(
+        created_by_id=principal.user_id,
+        limit=limit,
+        offset=offset,
+        status=status_filter,
+        workflow_id=workflow_id,
+    )
+    return ExecutionListResponse(
+        items=[
+            ExecutionSummary(
+                id=row.id,
+                workflow_id=row.workflow_id,
+                workflow_name=row.workflow_name,
+                status=row.status,
+                trigger=row.trigger.value,
+                host_count=row.host_count,
+                succeeded_host_count=row.succeeded_host_count,
+                failed_host_count=row.failed_host_count,
+                created_at=row.created_at,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+            )
+            for row in rows
+        ],
+        total=total,
+    )
+
+
 @router.get("/{execution_id}", response_model=ExecutionRead, summary="Execution detail")
 def read_execution(
     execution_id: int,
@@ -272,3 +319,64 @@ def cancel_execution(
     return CancelResponse(
         id=execution_id, status=current, cancel_requested=requested
     )
+
+
+@router.get(
+    "/{execution_id}/hosts/{host_run_id}/transcript",
+    response_model=HostTranscriptRead,
+    summary="Filesystem transcript for one host run",
+)
+def read_host_transcript(
+    execution_id: int,
+    host_run_id: int,
+    request: Request,
+    principal: sessions.Principal = Depends(require_principal),
+) -> HostTranscriptRead:
+    execution = _owned_execution(
+        execution_id, principal, action="read_transcript", request=request
+    )
+
+    host = next((row for row in execution.host_runs if row.id == host_run_id), None)
+    if host is None:
+        audit.record(
+            AuditAction.ACCESS_DENIED,
+            actor_id=principal.user_id,
+            actor_username=principal.label,
+            session_id=principal.session_id,
+            outcome=AuditOutcome.DENIED,
+            resource_type="execution_host_run",
+            resource_id=host_run_id,
+            remote_addr=client_ip(request),
+            detail={"reason": "host_run_not_in_execution"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Host run not found"
+        )
+
+    text = get_log_store().read_host_log(execution_id, host.id, host.hostname)
+    if text is None:
+        # A host that has not started yet, or whose transcript was pruned. This is a
+        # normal state rather than an error, so it answers 200 with available=False.
+        return HostTranscriptRead(
+            execution_id=execution_id,
+            host_run_id=host.id,
+            hostname=host.hostname,
+            available=False,
+        )
+
+    # Bound the payload: a runaway command can produce a very large transcript and
+    # the UI only renders the tail. The last bytes are the most useful for debugging.
+    limit = 256_000
+    truncated = len(text) > limit
+    if truncated:
+        text = text[-limit:]
+
+    return HostTranscriptRead(
+        execution_id=execution_id,
+        host_run_id=host.id,
+        hostname=host.hostname,
+        available=True,
+        truncated=truncated,
+        content=text,
+    )
+

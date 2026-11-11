@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_session_factory
@@ -397,6 +397,46 @@ def _credential_for(session: Session, host_run: ExecutionHostRun) -> tuple[int, 
     raise InvalidExecutionState(
         f"No credential could be resolved for host {host_run.hostname!r}."
     )
+
+
+def list_executions(
+    *,
+    created_by_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    status: ExecutionStatus | None = None,
+    workflow_id: int | None = None,
+) -> tuple[list[Execution], int]:
+    """History for one user, newest first, with the total matching count.
+
+    Scoped to ``created_by_id`` here rather than in the route so a caller cannot
+    forget the ownership filter and leak another user's runs. Host and step rows are
+    deliberately *not* eager-loaded: the summary row does not need them, and loading
+    them for a page of runs would multiply the query cost for no benefit.
+    """
+    session = _session()
+    try:
+        filters = [Execution.created_by_id == created_by_id]
+        if status is not None:
+            filters.append(Execution.status == status)
+        if workflow_id is not None:
+            filters.append(Execution.workflow_id == workflow_id)
+
+        total = session.scalar(
+            select(func.count()).select_from(Execution).where(*filters)
+        )
+        rows = list(
+            session.scalars(
+                select(Execution)
+                .where(*filters)
+                .order_by(Execution.id.desc())
+                .limit(limit)
+                .offset(offset)
+            ).all()
+        )
+        return rows, int(total or 0)
+    finally:
+        session.close()
 
 
 def get_execution(execution_id: int) -> Execution | None:

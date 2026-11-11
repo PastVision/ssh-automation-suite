@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import audit as audit_routes
 from app.api.routes import auth as auth_routes
+from app.api.routes import credentials as credential_routes
 from app.api.routes import executions, health
 from app.api.routes import locks as lock_routes
 from app.api.routes import profile as profile_routes
@@ -104,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(lock_routes.router, prefix=settings.api_prefix)
     app.include_router(audit_routes.router, prefix=settings.api_prefix)
     app.include_router(template_routes.router, prefix=settings.api_prefix)
+    app.include_router(credential_routes.router, prefix=settings.api_prefix)
     app.include_router(workflow_routes.router, prefix=settings.api_prefix)
     app.include_router(executions.router, prefix=settings.api_prefix)
 

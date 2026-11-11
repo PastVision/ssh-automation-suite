@@ -96,6 +96,47 @@ class ExecutionAccepted(BaseModel):
     status: ExecutionStatus
 
 
+class ExecutionSummary(BaseModel):
+    """One row of execution history.
+
+    Carries no host detail and no transcript: a list of hundreds of runs should not
+    embed every step. Opening a run reads ``ExecutionRead`` instead.
+    """
+
+    id: int
+    workflow_id: int | None = None
+    workflow_name: str
+    status: ExecutionStatus
+    trigger: str
+    host_count: int
+    succeeded_host_count: int
+    failed_host_count: int
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class ExecutionListResponse(BaseModel):
+    items: list[ExecutionSummary]
+    total: int
+
+
+class HostTranscriptRead(BaseModel):
+    """A host run's filesystem transcript.
+
+    The transcript is written by the runner and deliberately excludes variable
+    values and Run-As passwords (discovery records lengths and short previews only),
+    so it is safe to return to the execution's owner.
+    """
+
+    execution_id: int
+    host_run_id: int
+    hostname: str
+    available: bool
+    truncated: bool = False
+    content: str = ""
+
+
 class CancelResponse(BaseModel):
     id: int
     status: ExecutionStatus

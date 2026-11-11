@@ -227,7 +227,7 @@ Design choices worth knowing:
 ## Project structure
 
 ```
-ssh-automation-suite/
+.                            repository root
 ├── AGENTS.md                  agent/maintainer guidance and invariants
 ├── backend/
 │   ├── alembic.ini
@@ -245,25 +245,25 @@ ssh-automation-suite/
 │   ├── data/                  SQLite + keys (gitignored)
 │   ├── logs/                  execution transcripts (gitignored)
 │   └── tests/                 pytest suite
-└── frontend/
-    ├── vite.config.ts         port 5180, /api -> 8010 proxy, @/ alias
-    └── src/
-        ├── components/ui/     shadcn/ui primitives
-        ├── components/layout/ app shell, sidebar, nav config
-        ├── pages/             dashboard + four placeholders
-        ├── lib/               API client, shared types
-        └── hooks/             React Query hooks
+├── frontend/
+│   ├── vite.config.ts         port 5180, /api -> 8010 proxy, @/ alias
+│   └── src/
+│       ├── components/ui/     shadcn/ui primitives
+│       ├── components/layout/ app shell, sidebar, nav config
+│       ├── pages/             dashboard + four placeholders
+│       ├── lib/               API client, shared types
+│       └── hooks/             React Query hooks
 └── testlab/                 SSH integration test lab (independent of the app)
     ├── Dockerfile             one reusable OpenSSH server image
     ├── docker-compose.yml     20 hosts, dedicated network, no host ports
     ├── scripts/lab.py         keys / up / down / health / verify-auth / exec
     ├── simulations/           opt-in failure scenarios
     └── tests/                 artifact checks + live integration tests
-`
+```
 
-The 	estlab/ directory is self-contained: it is neither imported by the
+The `testlab/` directory is self-contained: it is neither imported by the
 application nor able to reach its database or encryption key. See
-[testlab/README.md](testlab/README.md).``
+[testlab/README.md](testlab/README.md).
 
 ---
 

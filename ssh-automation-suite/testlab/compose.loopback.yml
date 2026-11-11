@@ -1,0 +1,36 @@
+# OPT-IN override: publish each lab SSH port on the Windows host loopback only.
+#
+# The default docker-compose.yml publishes nothing. Use this file only when you
+# need a host-side port (for example, pointing the application at 127.0.0.1 from
+# the Windows host rather than running the client inside the lab network).
+#
+#   docker compose -f docker-compose.yml -f compose.loopback.yml up -d
+#
+# Every binding is prefixed with 127.0.0.1, so nothing is reachable from the LAN
+# or any other machine. The range is 2201-2220, one port per host.
+#
+# NOTE: `ports` in an override file merges with the base service definition; the
+# base file declares none, so these are the complete set.
+
+services:
+
+  ssh-host-01: { ports: ["127.0.0.1:2201:22"] }
+  ssh-host-02: { ports: ["127.0.0.1:2202:22"] }
+  ssh-host-03: { ports: ["127.0.0.1:2203:22"] }
+  ssh-host-04: { ports: ["127.0.0.1:2204:22"] }
+  ssh-host-05: { ports: ["127.0.0.1:2205:22"] }
+  ssh-host-06: { ports: ["127.0.0.1:2206:22"] }
+  ssh-host-07: { ports: ["127.0.0.1:2207:22"] }
+  ssh-host-08: { ports: ["127.0.0.1:2208:22"] }
+  ssh-host-09: { ports: ["127.0.0.1:2209:22"] }
+  ssh-host-10: { ports: ["127.0.0.1:2210:22"] }
+  ssh-host-11: { ports: ["127.0.0.1:2211:22"] }
+  ssh-host-12: { ports: ["127.0.0.1:2212:22"] }
+  ssh-host-13: { ports: ["127.0.0.1:2213:22"] }
+  ssh-host-14: { ports: ["127.0.0.1:2214:22"] }
+  ssh-host-15: { ports: ["127.0.0.1:2215:22"] }
+  ssh-host-16: { ports: ["127.0.0.1:2216:22"] }
+  ssh-host-17: { ports: ["127.0.0.1:2217:22"] }
+  ssh-host-18: { ports: ["127.0.0.1:2218:22"] }
+  ssh-host-19: { ports: ["127.0.0.1:2219:22"] }
+  ssh-host-20: { ports: ["127.0.0.1:2220:22"] }

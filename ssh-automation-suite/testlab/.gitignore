@@ -1,0 +1,13 @@
+# Lab SSH private keys must never be committed. Only the .pub half is safe,
+# and even that is regenerated per machine, so the whole directory is ignored.
+keys/
+*.key
+id_lab
+id_lab.pub
+id_lab_invalid*
+id_bad_tmp*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

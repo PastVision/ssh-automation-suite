@@ -1,0 +1,365 @@
+# SSH Integration Test Lab — 20 independent OpenSSH servers.
+#
+# Isolation model
+#   * Dedicated bridge network (ssh-lab-net, 172.28.0.0/16). Lab containers are
+#     addressable by hostname inside the lab only.
+#   * NO SSH port is published to the Windows host in this file. Every `ports`
+#     key is intentionally absent: the lab is reached from a container on
+#     ssh-lab-net (see scripts/lab.py), never through a host port. This is the
+#     strictest reading of "do not expose SSH ports to the Windows host".
+#     compose.loopback.yml is an opt-in override for the rare case where a host
+#     port is genuinely required; even then it binds 127.0.0.1 only.
+#   * Each service has its own writable layer, its own named host-key volume and
+#     its own PID namespace (Docker default). No `privileged`, no host mounts of
+#     application data.
+#   * The only host file shared with containers is read-only and holds nothing
+#     but the lab *public* key.
+#
+# This file is independent of backend/ and frontend/. It shares no network,
+# volume or credential with the application.
+
+name: ssh-lab
+
+x-lab-host: &lab-host
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ssh-lab/ssh-server:local
+  restart: unless-stopped
+  environment:
+    LAB_USER: tester
+    LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+  volumes:
+    # Public key only. The private key never enters a container.
+    - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+  # no-new-privileges is deliberately ABSENT for lab hosts. It blocks the setuid
+  # bit that sudo needs ("The \"no new privileges\" flag is set, which prevents
+  # sudo from running as root"), and Run-As is implemented with sudo. The
+  # controls that remain are the capability allowlist right below: the container
+  # can only ever do what these seven capabilities permit.
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+    - SETUID
+    - SETGID
+    - NET_BIND_SERVICE
+    # sudo's password path writes an audit record. Without CAP_AUDIT_WRITE every
+    # password-based `sudo -S` fails with "unable to send audit message:
+    # Operation not permitted" regardless of the password being correct.
+    - AUDIT_WRITE
+    # sshd performs a chroot to /run/sshd for privilege separation. Without
+    # CAP_SYS_CHROOT the daemon dies per connection with
+    # 'chroot("/run/sshd"): Operation not permitted [preauth]', which the client
+    # sees only as "Connection reset ... exit 255" before key exchange finishes.
+    # This is the one capability sshd genuinely cannot run without.
+    - SYS_CHROOT
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/22"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+  networks:
+    - ssh-lab
+
+services:
+
+  ssh-host-01:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-01
+    hostname: ssh-host-01
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-01
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-01-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-02:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-02
+    hostname: ssh-host-02
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-02
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-02-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-03:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-03
+    hostname: ssh-host-03
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-03
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-03-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-04:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-04
+    hostname: ssh-host-04
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-04
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-04-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-05:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-05
+    hostname: ssh-host-05
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-05
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-05-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-06:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-06
+    hostname: ssh-host-06
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-06
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-06-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-07:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-07
+    hostname: ssh-host-07
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-07
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-07-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-08:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-08
+    hostname: ssh-host-08
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-08
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-08-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-09:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-09
+    hostname: ssh-host-09
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-09
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-09-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-10:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-10
+    hostname: ssh-host-10
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-10
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-10-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-11:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-11
+    hostname: ssh-host-11
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-11
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-11-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-12:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-12
+    hostname: ssh-host-12
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-12
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-12-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-13:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-13
+    hostname: ssh-host-13
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-13
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-13-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-14:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-14
+    hostname: ssh-host-14
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-14
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-14-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-15:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-15
+    hostname: ssh-host-15
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-15
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-15-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-16:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-16
+    hostname: ssh-host-16
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-16
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-16-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-17:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-17
+    hostname: ssh-host-17
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-17
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-17-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-18:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-18
+    hostname: ssh-host-18
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-18
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-18-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-19:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-19
+    hostname: ssh-host-19
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-19
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-19-keys:/etc/ssh/lab-host-keys
+
+  ssh-host-20:
+    <<: *lab-host
+    container_name: ssh-lab-ssh-host-20
+    hostname: ssh-host-20
+    environment:
+      LAB_USER: tester
+      LAB_HOSTNAME: ssh-host-20
+      LAB_PUBKEY_PATH: /etc/lab/keys/id_lab.pub
+    volumes:
+      - ./keys/id_lab.pub:/etc/lab/keys/id_lab.pub:ro
+      - host-20-keys:/etc/ssh/lab-host-keys
+
+  # Ephemeral SSH client used by scripts/lab.py and the integration tests.
+  # It shares the ssh-lab network, so hosts are reachable by name with no port
+  # published to the Windows host. Started on demand via `run --rm` with the
+  # `client` profile, never part of a normal `up`.
+  lab-client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssh-lab/ssh-server:local
+    container_name: ssh-lab-client
+    profiles: ["client"]
+    # Every invocation overrides this with `--entrypoint lab-ssh-client`.
+    # /bin/true means a bare `compose run lab-client` exits immediately instead
+    # of hanging or accidentally starting a second sshd.
+    entrypoint: ["/bin/true"]
+    environment:
+      LAB_USER: tester
+    volumes:
+      # Private key is mounted read-only and only into this disposable client.
+      - ./keys:/etc/lab/keys:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - ssh-lab
+
+networks:
+  ssh-lab:
+    name: ssh-lab-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  host-01-keys:
+  host-02-keys:
+  host-03-keys:
+  host-04-keys:
+  host-05-keys:
+  host-06-keys:
+  host-07-keys:
+  host-08-keys:
+  host-09-keys:
+  host-10-keys:
+  host-11-keys:
+  host-12-keys:
+  host-13-keys:
+  host-14-keys:
+  host-15-keys:
+  host-16-keys:
+  host-17-keys:
+  host-18-keys:
+  host-19-keys:
+  host-20-keys:

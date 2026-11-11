@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+*.tsbuildinfo
+
+# Application state — never commit
+backend/data/
+backend/logs/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.key
+.env
+.env.*
+!.env.example
+
+# Local scratch: dev server logs, acceptance runs, ad-hoc verification output
+.devlogs/
+.tmp-acceptance/
+.tmp*/
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

@@ -168,8 +168,9 @@ export function DashboardPage() {
                 ))}
               </ul>
               <p className="text-muted-foreground mt-3 text-xs">
-                Schedules are created from a workflow. Whether this process dispatches
-                them is the scheduler status shown above.
+                Schedules are managed through the API; there is no scheduling screen
+                in this interface yet. Whether this process dispatches them is the
+                status shown above.
               </p>
             </CardContent>
           </Card>

@@ -108,6 +108,28 @@ class WorkflowInvalid(ValueError):
     """The submitted workflow body is not usable."""
 
 
+class WorkflowRunAsInvalid(WorkflowInvalid):
+    """A Run-As configuration that could never resolve a sudo password.
+
+    Carries the offending location so a client can point at the step instead of
+    only showing a banner. Deliberately holds no secret: it names the target
+    account, which is configuration, not a credential.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        entry_position: int | None,
+        target_username: str | None,
+        field: str,
+    ) -> None:
+        super().__init__(message)
+        self.entry_position = entry_position
+        self.target_username = target_username
+        self.field = field
+
+
 @dataclass(frozen=True)
 class VariableData:
     name: str
@@ -241,6 +263,185 @@ def _validate_run_as_blocks(entries: tuple[Entry, ...]) -> None:
             raise WorkflowInvalid(
                 "Two Run-As blocks cannot be adjacent: the first would govern no "
                 "templates. Put a template step between them."
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Run-As credential availability
+# --------------------------------------------------------------------------- #
+
+# A sudo password can only ever come from a workflow Run-As block, keyed by its
+# position: the executor looks one up by ``run_as_position`` and nothing else. So a
+# password-mode step is only satisfiable if it inherited that method from a block
+# and the block targets the same account it does. Both conditions are checked here,
+# at save *and* at launch, because a template can be edited after a workflow is
+# saved and a workflow's blocks can outlive the credential they need.
+
+
+@dataclass(frozen=True)
+class _BlockFacts:
+    """What a Run-As block contributes to password resolution, without the secret."""
+
+    target_username: str
+    has_password: bool
+
+
+def _resolve_step_run_as(
+    version_step,
+    block_target: str | None,
+    block_method: RunAsMethod | None,
+    block_position: int | None,
+) -> tuple[str | None, RunAsMethod | None, int | None]:
+    """Resolve one template step's effective Run-As identity.
+
+    Shared by execution-spec building and save-time validation on purpose: when
+    these two disagreed, a step could look configured in the editor and still be
+    unable to obtain a password at run time.
+    """
+    step_target = version_step.run_as_username or block_target
+    if version_step.run_as_username:
+        step_method = version_step.run_as_method
+        # A step that names its own method has no enclosing transition to inherit a
+        # password from; only ``None`` (inherit) keeps the block's position.
+        step_position = block_position if version_step.run_as_method is None else None
+    else:
+        step_method = block_method
+        step_position = block_position
+    return step_target, step_method, step_position
+
+
+def _require_satisfiable_run_as(
+    *,
+    step_target: str | None,
+    step_method: RunAsMethod | None,
+    step_position: int | None,
+    enclosing_block_target: str | None,
+    enclosing_block_has_password: bool,
+    blocks: dict[int, _BlockFacts],
+    entry_position: int,
+    label: str,
+) -> None:
+    """Refuse a password-mode step that could never obtain its password.
+
+    Passwordless and non-Run-As steps are always satisfiable: they need no stored
+    secret. Only password mode can be unserviceable, and the executor can only fetch
+    a password through a block *position*, so a step that declares its own method is
+    unserviceable by construction -- there is no transition to look up.
+
+    ``entry_position`` is the step's index in the body (what a client points at),
+    which is not the same thing as the block's position.
+    """
+    if not step_target:
+        return
+    method = step_method or RunAsMethod.NOPASSWD
+    if method is not RunAsMethod.PASSWORD:
+        return
+
+    block = blocks.get(step_position) if step_position is not None else None
+    if block is None:
+        if enclosing_block_target is not None and enclosing_block_has_password:
+            # A password-bearing block does apply here, but the step restated its own
+            # method, which detaches it from the block's transition and therefore its
+            # password.
+            raise WorkflowRunAsInvalid(
+                f"{label} sets its own sudo method ({step_target!r}), so it cannot "
+                f"use the password stored on the {enclosing_block_target!r} "
+                "Run-As block. Remove the step's method to inherit the block, or "
+                "switch it to passwordless sudo.",
+                entry_position=entry_position,
+                target_username=step_target,
+                field="run_as_method",
+            )
+        raise WorkflowRunAsInvalid(
+            f"{label} runs as {step_target!r} with a sudo password, but no Run-As "
+            "block provides that password. Switch it to passwordless sudo, or add a "
+            "Run-As block for that user before it.",
+            entry_position=entry_position,
+            target_username=step_target,
+            field="run_as_method",
+        )
+    if not block.has_password:
+        raise WorkflowRunAsInvalid(
+            f"{label} runs as {step_target!r} with a sudo password, but the Run-As "
+            "block for that user has no stored password. Re-enter it and save again.",
+            entry_position=entry_position,
+            target_username=step_target,
+            field="run_as_password",
+        )
+
+
+def _blocks_from_body(body: WorkflowBody) -> dict[int, _BlockFacts]:
+    """Blocks keyed by position, as the body declares them."""
+    return {
+        position: _BlockFacts(
+            target_username=entry.target_username,
+            has_password=bool(entry.password),
+        )
+        for position, entry in enumerate(body.entries)
+        if isinstance(entry, RunAsData)
+    }
+
+
+def _blocks_from_workflow(workflow: Workflow) -> dict[int, _BlockFacts]:
+    """Blocks keyed by position, as persisted. Reads presence, never ciphertext."""
+    return {
+        block.position: _BlockFacts(
+            target_username=block.target_username,
+            has_password=bool(block.password_encrypted),
+        )
+        for block in workflow.run_as_blocks
+    }
+
+
+def _validate_run_as_credentials(
+    session: Session, body: WorkflowBody
+) -> None:
+    """Reject body steps whose password-mode Run-As has no usable credential.
+
+    Runs against the body plus the templates' newest versions, which is exactly what
+    a launch would resolve, so a save cannot succeed into a configuration that is
+    already known to fail. Only presence is inspected; no password is decrypted.
+    """
+    template_ids = {
+        entry.template_id for entry in body.entries if isinstance(entry, StepData)
+    }
+    if not template_ids:
+        return
+    newest = _current_versions(session, template_ids)
+    blocks = _blocks_from_body(body)
+
+    block_target: str | None = None
+    block_method: RunAsMethod | None = None
+    block_position: int | None = None
+
+    for position, entry in enumerate(body.entries):
+        if isinstance(entry, RunAsData):
+            block_target = entry.target_username
+            block_method = entry.method
+            block_position = position
+            continue
+
+        version = newest.get(entry.template_id)
+        if version is None:
+            # ``validate_references`` reports a missing template; nothing to resolve.
+            continue
+        for version_step in sorted(version.steps, key=lambda s: s.position):
+            step_target, step_method, step_position = _resolve_step_run_as(
+                version_step, block_target, block_method, block_position
+            )
+            _require_satisfiable_run_as(
+                step_target=step_target,
+                step_method=step_method,
+                step_position=step_position,
+                enclosing_block_target=block_target,
+                enclosing_block_has_password=(
+                    blocks[block_position].has_password
+                    if block_position is not None and block_position in blocks
+                    else False
+                ),
+                blocks=blocks,
+                entry_position=position,
+                label=f"Step {position + 1}",
             )
 
 
@@ -516,6 +717,7 @@ def create(
     session = get_session_factory()()
     try:
         validate_references(session, body, principal)
+        _validate_run_as_credentials(session, body)
         duplicate = session.scalar(
             select(Workflow).where(
                 Workflow.owner_id == principal.user_id,
@@ -602,6 +804,7 @@ def update(
         locks.check_version(expected_row_version, workflow.row_version)
 
         validate_references(session, body, principal)
+        _validate_run_as_credentials(session, body)
 
         if body.name.strip().lower() != workflow.name.lower():
             clash = session.scalar(
@@ -843,6 +1046,7 @@ def build_execution_specs(
     block_target: str | None = None
     block_method: RunAsMethod | None = None
     block_position: int | None = None
+    resolved_blocks = _blocks_from_workflow(workflow)
 
     for entry in ordered_entries(workflow):
         if isinstance(entry, WorkflowRunAsBlock):
@@ -869,20 +1073,28 @@ def build_execution_specs(
         if not version_steps:
             raise WorkflowInvalid(f"Template {version.name!r} has no steps to run.")
         for version_step in version_steps:
-            # A step-level identity overrides the enclosing block. Inheriting
-            # ``block_position`` even when overridden keeps history anchored to the
-            # transition that introduced the context; a step with its own identity
-            # and no enclosing block gets no position, because no transition (and
-            # therefore no sudo password) is involved.
-            step_target = version_step.run_as_username or block_target
-            if version_step.run_as_username:
-                step_method = version_step.run_as_method
-                step_position = (
-                    block_position if version_step.run_as_method is None else None
-                )
-            else:
-                step_method = block_method
-                step_position = block_position
+            # Shared with save-time validation so the two cannot drift apart; see
+            # ``_resolve_step_run_as`` for why a step that names its own method has
+            # no position.
+            step_target, step_method, step_position = _resolve_step_run_as(
+                version_step, block_target, block_method, block_position
+            )
+            # Re-checked here rather than trusted from save: a template may have been
+            # edited, or a block's password cleared, since the workflow was saved.
+            _require_satisfiable_run_as(
+                step_target=step_target,
+                step_method=step_method,
+                step_position=step_position,
+                enclosing_block_target=block_target,
+                enclosing_block_has_password=(
+                    resolved_blocks[block_position].has_password
+                    if block_position is not None and block_position in resolved_blocks
+                    else False
+                ),
+                blocks=resolved_blocks,
+                entry_position=entry.position,
+                label=f"Step {entry.position + 1}",
+            )
             steps.append(
                 StepSpec(
                     template_name=version.name,

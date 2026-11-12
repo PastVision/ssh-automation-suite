@@ -650,8 +650,14 @@ class ExecutionRunner:
         method = step.run_as_method or RunAsMethod.NOPASSWD
         password = None
         if method is RunAsMethod.PASSWORD:
-            password = (self._run_as_passwords.get(execution_id) or {}).get(
-                step.run_as_position or -1
+            # ``is not None``, not a truthiness fallback: position 0 is a real block,
+            # and ``or -1`` would silently look up a key that never exists.
+            password = (
+                (self._run_as_passwords.get(execution_id) or {}).get(
+                    step.run_as_position
+                )
+                if step.run_as_position is not None
+                else None
             )
         context = run_as.RunAsContext(
             target_username=step.run_as_username, method=method, password=password

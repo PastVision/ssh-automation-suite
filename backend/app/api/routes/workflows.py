@@ -18,9 +18,11 @@ has no password field, so no serializer can leak it.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.db.types import as_utc
 from app.models.audit_actions import AuditAction, AuditOutcome
 from app.models.workflow import Workflow, WorkflowRunAsBlock
 from app.schemas.workflow import (
@@ -157,7 +159,11 @@ def _detail(workflow: Workflow, principal: sessions.Principal) -> WorkflowDetail
 
 
 def _summary(
-    workflow: Workflow, principal: sessions.Principal, *, active_execution_count: int = 0
+    workflow: Workflow,
+    principal: sessions.Principal,
+    *,
+    active_execution_count: int = 0,
+    last_run_at: datetime | None = None,
 ) -> WorkflowSummary:
     return WorkflowSummary(
         id=workflow.id,
@@ -171,6 +177,7 @@ def _summary(
         visibility=workflow.visibility,
         execution_permission=workflow.execution_permission,
         active_execution_count=active_execution_count,
+        last_run_at=last_run_at,
         step_count=len(workflow.steps),
         run_as_count=len(workflow.run_as_blocks),
         variable_count=len(workflow.variables),
@@ -187,6 +194,25 @@ def _not_found() -> HTTPException:
 def _invalid(exc: Exception) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+    )
+
+
+def _run_as_invalid(exc: workflows.WorkflowRunAsInvalid) -> HTTPException:
+    """422 with the offending step, so the editor can mark that row.
+
+    ``detail`` is an object rather than a bare string; clients that only read
+    ``detail.message`` keep working, and it carries no credential value -- just the
+    target account, which the user typed.
+    """
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "message": str(exc),
+            "code": "run_as_credential_unavailable",
+            "entry_position": exc.entry_position,
+            "target_username": exc.target_username,
+            "field": exc.field,
+        },
     )
 
 
@@ -219,13 +245,24 @@ def list_workflows(
     principal: sessions.Principal = Depends(require_principal),
 ) -> WorkflowListResponse:
     items = workflows.list_for_user(principal, search=search)
-    # One query for every workflow's running count; see
-    # ``execution_state.active_counts_by_workflow``.
+    # Two grouped queries for the whole page -- running counts and last-run times --
+    # so neither badge can turn a list render into N+1 round trips.
     active_counts = execution_state.active_counts_by_workflow()
+    last_runs = execution_state.last_started_at_by_workflow()
     return WorkflowListResponse(
         items=[
             _summary(
-                workflow, principal, active_execution_count=active_counts.get(workflow.id, 0)
+                workflow,
+                principal,
+                active_execution_count=active_counts.get(workflow.id, 0),
+                # Normalised because SQLite returns these naive; the schema promises
+                # an instant, and an offset-less value would be read as local time by
+                # a browser.
+                last_run_at=(
+                    as_utc(last_runs[workflow.id])
+                    if workflow.id in last_runs
+                    else None
+                ),
             )
             for workflow in items
         ]
@@ -249,6 +286,8 @@ def create_workflow(
         )
     except workflows.WorkflowConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except workflows.WorkflowRunAsInvalid as exc:
+        raise _run_as_invalid(exc) from exc
     except (workflows.WorkflowInvalid, ValueError) as exc:
         raise _invalid(exc) from exc
     return _detail(workflow, principal)
@@ -295,6 +334,8 @@ def update_workflow(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except workflows.WorkflowConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except workflows.WorkflowRunAsInvalid as exc:
+        raise _run_as_invalid(exc) from exc
     except (workflows.WorkflowInvalid, ValueError) as exc:
         raise _invalid(exc) from exc
     return _detail(workflow, principal)
@@ -352,6 +393,8 @@ async def run_workflow(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
+    except workflows.WorkflowRunAsInvalid as exc:
+        raise _run_as_invalid(exc) from exc
     except (workflows.WorkflowInvalid, ValueError) as exc:
         raise _invalid(exc) from exc
     return WorkflowRunResponse(execution_id=execution_id)

@@ -312,9 +312,9 @@ function WorkflowCard({
             {workflow.host_count} host{workflow.host_count === 1 ? '' : 's'}
           </span>
           {/*
-            `last_run_at` is never populated by the backend, so it is shown only
-            when it actually carries a value. Rendering "never run" for it would
-            be a lie about a workflow that ran a minute ago.
+            `last_run_at` reflects when this workflow last *started* a run, successful
+            or not, and is null until it has run. Shown only when populated so a
+            never-run workflow does not claim a run time it does not have.
           */}
           {workflow.last_run_at ? (
             <span>last run {formatApiInstant(workflow.last_run_at)}</span>

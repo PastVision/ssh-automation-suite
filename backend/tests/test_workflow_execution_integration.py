@@ -270,7 +270,10 @@ def test_a_run_as_password_is_decrypted_for_the_run_and_never_logged(lab_env):
     from app.services import execution_state as state
 
     settings, credential_id = lab_env
-    password = "Sup3rSecretSudo"
+    # The lab image seeds this as the sudo password (see testlab/Dockerfile). Using
+    # the real value is the point: it proves the password reached sudo, not merely
+    # that some string was stored.
+    password = "LabSudoPassword1"
 
     # The loader reads blocks from the execution's workflow, so one must exist.
     session = get_session_factory()()
@@ -289,7 +292,11 @@ def test_a_run_as_password_is_decrypted_for_the_run_and_never_logged(lab_env):
             WorkflowRunAsBlock(
                 workflow_id=workflow.id,
                 position=0,
-                target_username="deploy",
+                # ``opspw`` is the lab account whose sudo *requires* a password
+                # (``tester ALL=(opspw) ALL``). Targeting ``deploy`` instead would
+                # prove nothing: that grant is NOPASSWD, so the step would succeed
+                # even if the executor handed sudo no password at all.
+                target_username="opspw",
                 method=ModelMethod.PASSWORD,
                 password_encrypted=encrypt_secret(password),
             )
@@ -308,7 +315,7 @@ def test_a_run_as_password_is_decrypted_for_the_run_and_never_logged(lab_env):
                 script="whoami\n",
                 interpreter="bash",
                 timeout_seconds=30,
-                run_as_username="deploy",
+                run_as_username="opspw",
                 run_as_method=RunAsMethod.PASSWORD,
                 run_as_position=0,
             )
@@ -329,6 +336,19 @@ def test_a_run_as_password_is_decrypted_for_the_run_and_never_logged(lab_env):
         / f"{execution.host_runs[0].id}-127.0.0.1.log"
     ).read_text(encoding="utf-8")
     assert password not in transcript
+
+    # The step must actually have run *as the target*. Without this the test passed
+    # even when the executor looked up position -1 and handed sudo no password at
+    # all: the run failed, the password was equally absent from the log, and the
+    # assertion above was satisfied by the failure itself.
+    assert execution.status is ExecutionStatus.SUCCEEDED, transcript
+    assert [run.status for run in execution.host_runs[0].step_runs] == [
+        StepRunStatus.SUCCEEDED
+    ]
+    # ``whoami`` is the step's script, so the target account appearing in the
+    # transcript is the account sudo actually became. Step output is written to the
+    # transcript, not to SQLite.
+    assert "opspw" in transcript
 
 
 def test_a_password_block_whose_workflow_is_gone_sends_no_password(lab_env):

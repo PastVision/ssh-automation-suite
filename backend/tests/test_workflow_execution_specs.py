@@ -357,3 +357,126 @@ def test_a_workflow_with_no_steps_is_refused(migrated_db, alice, credential_id):
 
     with pytest.raises(workflows.WorkflowInvalid, match="no steps"):
         workflows.build_execution_specs(_load(workflow_id))
+
+
+# --------------------------------------------------------------------------- #
+# Run-As credential availability at launch
+# --------------------------------------------------------------------------- #
+#
+# Save-time validation is not enough on its own: a template is *live*, so editing it
+# after the workflow was saved can turn an ordinary step into a password-mode one.
+# The launch path therefore re-checks, and must refuse before creating an execution
+# rather than letting every host fail at the sudo step.
+
+
+def _flip_template_step_to_password(template_id: int, username: str) -> None:
+    """Make an existing template step demand a sudo password.
+
+    Simulates the second save-order a real user can produce: the workflow is saved
+    while the template is unprivileged, then the template is edited. Steps hang off a
+    version, so the version is joined back to its template.
+    """
+    from app.db.session import get_session_factory
+    from app.models.template import TemplateStep, TemplateVersion
+
+    db = get_session_factory()()
+    try:
+        step = (
+            db.query(TemplateStep)
+            .join(TemplateVersion, TemplateStep.version_id == TemplateVersion.id)
+            .filter(TemplateVersion.template_id == template_id)
+            .one()
+        )
+        step.run_as_username = username
+        step.run_as_method = RunAsMethod.PASSWORD
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_launch_refuses_a_password_step_that_cannot_get_a_password(
+    migrated_db, alice, credential_id
+):
+    """Reached by editing the template after the workflow was saved.
+
+    The workflow's own entries are untouched and were valid when saved; only the
+    live template changed. Launch must still refuse, before creating an execution.
+    """
+    template_id = _make_template(alice, "becomes-pw", ["id\n"])
+    workflow_id = _created(
+        alice,
+        credential_id,
+        entries=(workflows.StepData(template_id=template_id),),
+    )
+    _flip_template_step_to_password(template_id, "ops")
+
+    with pytest.raises(workflows.WorkflowRunAsInvalid) as caught:
+        workflows.build_execution_specs(_load(workflow_id))
+
+    # Names the account and says what to do, not just "invalid".
+    assert caught.value.target_username == "ops"
+    assert "no Run-As block" in str(caught.value)
+
+
+def test_launch_allows_a_password_step_that_inherits_a_matching_block(
+    migrated_db, alice, credential_id
+):
+    """The supported shape must stay runnable, or the guard is just an outage."""
+    template_id = _make_template(alice, "inherits", ["id\n"])
+    workflow_id = _created(
+        alice,
+        credential_id,
+        entries=(
+            workflows.RunAsData(
+                target_username="ops", method=RunAsMethod.PASSWORD, password="LabSudo1"
+            ),
+            workflows.StepData(template_id=template_id),
+        ),
+    )
+
+    steps, _, _ = workflows.build_execution_specs(_load(workflow_id))
+
+    assert steps[0].run_as_username == "ops"
+    # The step is unprivileged in its own template, so it inherits the block.
+    assert steps[0].run_as_method is RunAsMethod.PASSWORD
+    # The position is what the executor uses to fetch the password.
+    assert steps[0].run_as_position is not None
+
+
+def test_launch_refuses_when_the_block_holds_no_password(
+    migrated_db, alice, credential_id
+):
+    """A password-mode block can carry no ciphertext, and that must not run.
+
+    The API refuses to *save* such a block, so this state is only reachable out of
+    band (a row written by an older build, a manual edit, a restored backup). It is
+    still checked at launch: sudo receiving an empty password fails obscurely on the
+    host, and a NULL column must not be mistaken for "no password needed".
+    """
+    from app.db.session import get_session_factory
+    from app.models.workflow import WorkflowRunAsBlock
+
+    template_id = _make_template(alice, "plain", ["id\n"])
+    workflow_id = _created(
+        alice,
+        credential_id,
+        entries=(
+            workflows.RunAsData(target_username="ops", method=RunAsMethod.NOPASSWD),
+            workflows.StepData(template_id=template_id),
+        ),
+    )
+
+    db = get_session_factory()()
+    try:
+        block = db.query(WorkflowRunAsBlock).filter_by(workflow_id=workflow_id).one()
+        # Password mode with no secret, bypassing the service that would refuse it.
+        block.method = RunAsMethod.PASSWORD
+        block.password_encrypted = None
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(workflows.WorkflowRunAsInvalid) as caught:
+        workflows.build_execution_specs(_load(workflow_id))
+
+    assert "no stored password" in str(caught.value)

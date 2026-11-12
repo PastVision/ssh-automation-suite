@@ -1059,6 +1059,40 @@ def latest_execution_started_at() -> datetime | None:
         session.close()
 
 
+def last_started_at_by_workflow() -> dict[int, datetime]:
+    """Most recent actual start time per workflow, for a whole list in one query.
+
+    Deliberately ``MAX(started_at)`` and not ``MAX(created_at)``: ``started_at`` is
+    written when a host workflow actually begins, while a PENDING row has not
+    started yet. A queued run must not make a workflow look as if it already ran.
+
+    Terminal and non-terminal executions are both included. "Last run" answers
+    *when this last ran*, not *when it last succeeded*, so a failed or cancelled
+    attempt is the honest answer -- otherwise a workflow that fails every time
+    would report the same stale timestamp forever.
+
+    Grouped like ``active_counts_by_workflow`` so rendering a workflow list cannot
+    degrade into one query per row.
+    """
+    session = _session()
+    try:
+        rows = session.execute(
+            select(Execution.workflow_id, func.max(Execution.started_at))
+            .where(
+                Execution.workflow_id.is_not(None),
+                Execution.started_at.is_not(None),
+            )
+            .group_by(Execution.workflow_id)
+        ).all()
+        return {
+            workflow_id: started_at
+            for workflow_id, started_at in rows
+            if started_at is not None
+        }
+    finally:
+        session.close()
+
+
 def reconcile_abandoned_executions(
     *, exclude: set[int] | None = None, reason: str
 ) -> list[int]:

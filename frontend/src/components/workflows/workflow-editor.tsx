@@ -31,6 +31,7 @@ import {
 import { useCredentials } from '@/hooks/use-credentials'
 import { useTemplates } from '@/hooks/use-templates'
 import { useWorkflowLock } from '@/hooks/use-workflows'
+import { ApiError } from '@/lib/api-client'
 import type {
   ExecutionPermission,
   RunAsMethod,
@@ -358,6 +359,10 @@ export function WorkflowEditor({
   const canSave = (isNew || lock.held !== null) && !saving
 
   const validation = useMemo(() => validateWorkflow(state), [state])
+  // A save-time rejection that names one entry, so the error can be shown on that
+  // row instead of only in the banner. It stays tied to the failed submission until
+  // the next one, which is what "this is why the last save was refused" means.
+  const entryError = useMemo(() => entryErrorOf(error), [error])
 
   function patch(changes: Partial<EditorState>) {
     setState((current) => ({ ...current, ...changes }))
@@ -750,6 +755,12 @@ export function WorkflowEditor({
                     )}
                   </div>
                 )}
+
+                {entryError?.index === index && (
+                  <p className="mt-2 text-xs font-medium text-destructive" role="alert">
+                    {entryError.message}
+                  </p>
+                )}
               </li>
             ))}
           </ol>
@@ -1030,6 +1041,31 @@ function HostBulkInput({ onAdd }: { onAdd: (text: string) => void }) {
       </div>
     </div>
   )
+}
+
+/**
+ * The entry a save error blames, when the backend named one.
+ *
+ * `entry_position` is the entry's index in the submitted body, not a Run-As block
+ * number, so it is matched against the entry list directly. Anything without that
+ * field (a lock conflict, a stale version, a generic 422) yields `null` and keeps
+ * its existing banner-only treatment.
+ *
+ * `ApiError.detail` is a getter that flattens the structured body to a string, so
+ * the raw `body` is read here: the position and message only exist as object fields.
+ */
+function entryErrorOf(
+  error: unknown,
+): { index: number; message: string } | null {
+  if (!(error instanceof ApiError)) return null
+  const body = error.body
+  if (!body || typeof body !== 'object' || !('detail' in body)) return null
+  const detail = (body as { detail?: unknown }).detail
+  if (!detail || typeof detail !== 'object') return null
+  const position = (detail as { entry_position?: unknown }).entry_position
+  const message = (detail as { message?: unknown }).message
+  if (typeof position !== 'number' || typeof message !== 'string') return null
+  return { index: position, message }
 }
 
 function SubmitError({

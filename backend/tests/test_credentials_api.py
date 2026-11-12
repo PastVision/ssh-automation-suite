@@ -412,9 +412,9 @@ def test_delete_is_blocked_while_an_execution_is_active(
 
     # A workflow id alone cannot be deleted once an execution references it, so
     # record the run without a workflow link to keep the reference checks honest.
+    from app.db.session import get_session_factory
     from app.models.enums import ExecutionStatus
     from app.models.execution import Execution
-    from app.db.session import get_session_factory
 
     session = get_session_factory()()
     try:

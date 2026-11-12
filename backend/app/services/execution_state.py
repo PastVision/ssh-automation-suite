@@ -138,7 +138,6 @@ def create_execution(
     variables = variables or []
     owns_session = session is None
     session = session or _session()
-    log_store = ExecutionLogStore()
     prepared_dir: Path | None = None
     try:
         execution = Execution(

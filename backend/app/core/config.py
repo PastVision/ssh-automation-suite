@@ -157,24 +157,31 @@ class Settings(BaseSettings):
         prefix = "/" + value.strip("/")
         return "" if prefix == "/" else prefix
 
+    @staticmethod
+    def _anchor(path: Path) -> Path:
+        """Resolve a path, anchoring relative ones to the backend directory.
+
+        Anchoring to ``BACKEND_DIR`` rather than the process working directory is
+        what makes the layout launch-directory independent. For the key file in
+        particular, a CWD-relative path would yield a different (newly generated)
+        key per launch directory and silently make stored credentials
+        undecryptable; for the data and log directories it would split runtime
+        state across two trees, leaving the database and execution logs outside
+        the ignored ``backend/`` tree.
+        """
+        expanded = path.expanduser()
+        if not expanded.is_absolute():
+            expanded = BACKEND_DIR / expanded
+        return expanded.resolve()
+
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
-        self.data_dir = self.data_dir.expanduser().resolve()
-        self.log_dir = self.log_dir.expanduser().resolve()
-        # A relative secret_key_file must anchor to the backend directory, not the
-        # process working directory: otherwise a different launch directory yields a
-        # different (newly generated) key and every stored credential becomes
-        # undecryptable.
+        self.data_dir = self._anchor(self.data_dir)
+        self.log_dir = self._anchor(self.log_dir)
         if self.secret_key_file is not None:
-            key_file = self.secret_key_file.expanduser()
-            if not key_file.is_absolute():
-                key_file = BACKEND_DIR / key_file
-            self.secret_key_file = key_file.resolve()
+            self.secret_key_file = self._anchor(self.secret_key_file)
         if self.ssh_known_hosts_file is not None:
-            known_hosts = self.ssh_known_hosts_file.expanduser()
-            if not known_hosts.is_absolute():
-                known_hosts = BACKEND_DIR / known_hosts
-            self.ssh_known_hosts_file = known_hosts.resolve()
+            self.ssh_known_hosts_file = self._anchor(self.ssh_known_hosts_file)
         return self
 
     @model_validator(mode="after")

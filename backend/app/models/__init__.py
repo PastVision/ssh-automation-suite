@@ -33,10 +33,10 @@ from app.models.schedule import (
     PausedReason,
     Schedule,
     ScheduleKind,
+    SchedulerLease,
     ScheduleRun,
     ScheduleRunOutcome,
     ScheduleState,
-    SchedulerLease,
 )
 from app.models.template import (
     Template,

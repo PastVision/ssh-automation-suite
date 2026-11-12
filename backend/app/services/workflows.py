@@ -41,8 +41,7 @@ from app.models.workflow import (
     WorkflowStep,
     WorkflowVariable,
 )
-from app.services import audit, locks, permissions, run_as, variables
-from app.services import execution_state
+from app.services import audit, execution_state, locks, permissions, run_as, variables
 from app.services.execution_runner import get_runner
 from app.services.sessions import Principal
 

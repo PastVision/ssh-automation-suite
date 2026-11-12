@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -48,8 +48,8 @@ from app.models.schedule import (
 from app.models.user import User
 from app.models.workflow import Workflow
 from app.services import audit, execution_state, permissions
-from app.services.execution_state import discard_execution_dir, write_execution_manifest
 from app.services.execution_runner import get_runner
+from app.services.execution_state import discard_execution_dir, write_execution_manifest
 from app.services.lease import SchedulerLease
 from app.services.sessions import Principal
 from app.services.workflows import (
@@ -177,7 +177,7 @@ def dispatch(
                     session=session,
                     start_runner=False,
                 )
-        except IntegrityError as exc:
+        except IntegrityError:
             # The overlap gate, not an error: a previous run of this schedule is
             # still pending or running. Only the savepoint was rolled back, so the
             # ledger row survives to record the decision.

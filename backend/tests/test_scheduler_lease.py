@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from sqlalchemy import text
 
-from app.db.session import get_session_factory
 from app.core.config import get_settings
+from app.db.session import get_session_factory
 from app.services.lease import (
     SchedulerLease,
     read_lease,

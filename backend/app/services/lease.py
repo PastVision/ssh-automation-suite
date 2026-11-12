@@ -126,7 +126,9 @@ class SchedulerLease:
     """
 
     def __init__(self, holder_id: str | None = None) -> None:
-        self.holder_id = holder_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        self.holder_id = holder_id or (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        )
         self.generation: int | None = None
         self._expires_at: datetime | None = None
         self._state = LeaseState(held=False, reason="not_acquired")

@@ -21,6 +21,11 @@ dist-ssr/
 # Application state — never commit
 backend/data/
 backend/logs/
+# Root-level equivalents: relative paths anchor to backend/, but a stray manual
+# run from the repository root would otherwise leave runtime state (and execution
+# logs, which can contain host output) inside the tree.
+/data/
+/logs/
 *.db
 *.db-wal
 *.db-shm

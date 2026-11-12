@@ -4,14 +4,13 @@ Run reusable shell-script templates over SSH across many hosts, from a small
 self-hosted web UI. No Redis, no Celery, no Kubernetes — one FastAPI process, a
 SQLite file, and logs on disk.
 
-> **Status: Milestones 1-3 and 5-7 complete; milestone 4 nearly complete.**
+> **Status: Milestones 1-7 complete.**
 > Credentials, versioned templates, workflows, the SSH execution engine,
-> end-to-end workflow authoring in the browser, APScheduler-based scheduling and
-> live transcript streaming all work against the local Docker SSH lab.
-> Scheduling has an API and no screen yet. Milestone 4 still lacks a live view of
-> *execution* progress -- per-host transcripts stream over a WebSocket, while the
-> run's own status is polled. See [Roadmap](#roadmap) for what each milestone
-> covers.
+> end-to-end workflow authoring and scheduling in the browser, APScheduler-based
+> execution and live transcript streaming all work against the local Docker SSH
+> lab. Per-host transcripts stream over a WebSocket; the run's own status is
+> polled, which is deliberate -- the stream carries output, not aggregate state.
+> See [Roadmap](#roadmap) for what each milestone covers.
 
 ---
 
@@ -482,8 +481,8 @@ isolation, the global concurrency ceiling, cancellation, and shutdown.
 | **1 (done)** | Foundation: structure, config, SQLite + migrations, health endpoint, dashboard shell |
 | **2 (done)** | SSH credentials, versioned templates, workflows, execution history, log store, SSH test lab |
 | **3 (done)** | SSH execution engine: 20-host concurrency, sequential steps, fail-fast per host, cancellation, shutdown |
-| 4 (nearly done) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming for per-host transcripts: **done**, with replay, live chunks and reconnect-safe offsets. Not yet streamed: the execution's own progress, which the UI still polls |
-| **5 (done)** | APScheduler scheduling: one-time and recurring schedules, firing ledger, misfire policy, lease-based single dispatcher, bounded catch-up. Schedules API only; no scheduling UI yet |
+| **4 (done)** | Execution history UI and filesystem log viewer, plus WebSocket log streaming for per-host transcripts with replay, live chunks and reconnect-safe offsets. The execution's own status is polled rather than streamed |
+| **5 (done)** | APScheduler scheduling: one-time and recurring schedules, firing ledger, misfire policy, lease-based single dispatcher, bounded catch-up. Schedules API and the scheduling UI in the workflow screen |
 | **6 (done)** | End-to-end workflow authoring in the UI: editor, host list, variables, run monitor, execution detail |
 | **7 (done)** | Scheduled execution reliability: overlap control, orphaned-run reconciliation after a crash, scheduler status on the dashboard, lab coverage for a scheduled firing |
 

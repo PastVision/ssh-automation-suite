@@ -39,7 +39,7 @@ from app.schemas.workflow import (
     WorkflowSummary,
     WorkflowUpdate,
 )
-from app.services import execution_state, locks, sessions, workflows
+from app.services import execution_state, locks, permissions, sessions, workflows
 from app.services.identity import client_ip, require_principal
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,11 @@ def _variables_from(payload: list) -> tuple[workflows.VariableData, ...]:
             discovery_command=item.discovery_command,
             description=item.description,
             timeout_seconds=item.timeout_seconds,
+            # Without these two the client's choice is discarded and every variable
+            # silently becomes command-backed, so a static value never survives the
+            # round trip from the editor to the execution spec.
+            source=item.source,
+            static_value=item.static_value,
         )
         for item in payload
     )
@@ -97,6 +102,11 @@ def _body(payload: WorkflowCreate | WorkflowUpdate) -> workflows.WorkflowBody:
         entries=_entries_from(payload.entries),
         variables=_variables_from(payload.variables),
         hosts=_hosts_from(payload.hosts),
+        # ``None`` on update means "leave unchanged", so it is passed through as
+        # ``None`` rather than replaced by a default here. For create the schema
+        # already supplies the secure defaults (private, owner-only).
+        visibility=payload.visibility,
+        execution_permission=payload.execution_permission,
     )
 
 
@@ -329,6 +339,15 @@ async def run_workflow(
     except workflows.WorkflowNotFound as exc:
         _denied(principal, request, workflow_id, "workflow_not_runnable")
         raise _not_found() from exc
+    except permissions.NotAuthorized as exc:
+        # Visible but not runnable. Recorded as its own reason so the audit trail
+        # distinguishes "started an SSH run they were not allowed to" from a plain
+        # read denial. ``launch`` raises this before creating anything, so no
+        # execution row and no SSH connection exist when this is returned.
+        _denied(principal, request, workflow_id, "workflow_not_runnable")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=exc.detail
+        ) from exc
     except workflows.WorkflowConflict as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)

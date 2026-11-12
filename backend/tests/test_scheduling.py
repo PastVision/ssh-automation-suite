@@ -362,6 +362,113 @@ def test_an_inactive_owner_is_recorded_as_skipped(
     assert _execution_count() == 0
 
 
+def _grantee(username: str) -> Principal:
+    """A second real account, for workflows shared with someone else."""
+    user_id = lab.ensure_test_owner(username)
+    issued = __import__("app.services.sessions", fromlist=["x"]).create_session(
+        user_id, user_agent="test", remote_addr=None
+    )
+    return Principal(
+        user_id=user_id,
+        username=username,
+        display_name="Grantee",
+        source="test",
+        session_id=issued.session_id,
+    )
+
+
+def _shared_workflow(settings, owner: Principal, grantee: Principal) -> int:
+    """A workflow owned by ``owner`` and shared view-only with ``grantee``."""
+    from app.models.permission import PermissionLevel, ResourceType
+    from app.services import permissions
+
+    credential_id = lab.create_lab_credential(
+        get_settings(), owner_id=owner.user_id
+    )
+    template_id = _make_template(owner)
+    workflow_id = workflows.create(
+        workflows.WorkflowBody(
+            name="shared-nightly",
+            description=None,
+            credential_id=credential_id,
+            entries=(workflows.StepData(template_id=template_id),),
+            variables=(),
+            hosts=(workflows.HostData(hostname="web-1.example.com", port=None),),
+        ),
+        principal=owner,
+    ).id
+    permissions.grant(
+        ResourceType.WORKFLOW,
+        workflow_id,
+        user_id=grantee.user_id,
+        level=PermissionLevel.VIEW,
+        granted_by_id=owner.user_id,
+    )
+    return workflow_id
+
+
+def test_a_schedule_whose_owner_lost_run_rights_is_recorded_as_unauthorized(
+    migrated_db, runner, owner
+) -> None:
+    """A schedule fires with its owner's rights, so ``execution_permission`` binds it.
+
+    The dangerous case: a grantee schedules a workflow that is shared with them, and
+    the workflow owner later narrows execution to ``owner_only``. The grantee keeps
+    view access, so the old ``can_view`` check still passed and the schedule kept
+    opening SSH sessions the grantee could no longer start by hand.
+    """
+    from app.db.session import get_session_factory
+    from app.models.workflow import ExecutionPermission, Workflow
+    from app.services import dispatch
+
+    grantee = _grantee("scheduler-grantee")
+    workflow_id = _shared_workflow(migrated_db, owner, grantee)
+    lease = _held_lease()
+    schedule_id = _schedule(grantee, workflow_id, next_run_at=NOW)
+
+    session = get_session_factory()()
+    try:
+        row = session.get(Workflow, workflow_id)
+        row.execution_permission = ExecutionPermission.OWNER_ONLY
+        session.commit()
+    finally:
+        session.close()
+
+    result = dispatch.dispatch(schedule_id, NOW, lease=lease)
+
+    assert result.outcome is ScheduleRunOutcome.UNAUTHORIZED, result.detail
+    assert _outcomes(schedule_id) == [ScheduleRunOutcome.UNAUTHORIZED.value]
+    assert _execution_count() == 0
+    assert runner.started == []
+
+
+def test_a_schedule_still_fires_while_the_grantee_may_run(
+    migrated_db, runner, owner
+) -> None:
+    """The check must not block a grantee the policy still permits."""
+    from app.db.session import get_session_factory
+    from app.models.workflow import ExecutionPermission, Workflow
+    from app.services import dispatch
+
+    grantee = _grantee("scheduler-grantee-allowed")
+    workflow_id = _shared_workflow(migrated_db, owner, grantee)
+    lease = _held_lease()
+    schedule_id = _schedule(grantee, workflow_id, next_run_at=NOW)
+
+    session = get_session_factory()()
+    try:
+        row = session.get(Workflow, workflow_id)
+        row.execution_permission = ExecutionPermission.SELECTED
+        session.commit()
+    finally:
+        session.close()
+
+    result = dispatch.dispatch(schedule_id, NOW, lease=lease)
+
+    assert result.outcome is ScheduleRunOutcome.DISPATCHED, result.detail
+    assert _execution_count() == 1
+
+
 def test_a_runner_that_will_not_start_fails_the_execution(
     migrated_db, runner, owner, workflow_id
 ) -> None:

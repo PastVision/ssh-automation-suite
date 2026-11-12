@@ -31,6 +31,7 @@ from app.models.enums import (
     StepAction,
     StepDecision,
     StepRunStatus,
+    VariableSource,
 )
 from app.models.workflow import RunAsMethod
 from app.services import (
@@ -512,6 +513,28 @@ class ExecutionRunner:
             if token.cancelled:
                 self._cancel_host(host_run_id, transcript, token, 0)
                 return None
+
+            # A user-defined variable is already resolved: its value was frozen into
+            # the execution at launch. Branching on ``source`` (not on "the command
+            # happens to be blank") means an empty static value is still a value, and
+            # nothing here opens an SSH command for it.
+            if spec.source is VariableSource.USER_DEFINED:
+                value = spec.static_value or ""
+                values[spec.name] = value
+                execution_state.record_discovery(
+                    host_run_id,
+                    spec.name,
+                    status=StepRunStatus.SUCCEEDED,
+                    duration_ms=0,
+                    value_length=len(value),
+                    detail=(
+                        f"user-defined value, {len(value)} characters"
+                        if value
+                        else "user-defined empty value"
+                    ),
+                )
+                transcript.note(f"using user-defined value for {spec.name!r}")
+                continue
 
             started_at = utcnow()
             start = time.monotonic()

@@ -45,7 +45,7 @@ from app.schemas.execution import (
     HostTranscriptRead,
     StepRunRead,
 )
-from app.services import audit, execution_state, sessions
+from app.services import audit, execution_state, permissions, sessions
 from app.services.execution_state import HostSpec, StepSpec
 from app.services.identity import (
     client_ip,
@@ -111,6 +111,9 @@ def _owned_execution(
 
     Typed on ``HTTPConnection`` so the transcript WebSocket shares this exact
     check instead of re-deriving it; only ``.client`` is read, which both provide.
+
+    This is the *metadata* check. Transcripts go through ``_execution_for_logs``,
+    which additionally applies the execution's own ``log_visibility``.
     """
     execution = execution_state.get_execution(execution_id)
     if execution is None or execution.created_by_id != principal.user_id:
@@ -124,6 +127,51 @@ def _owned_execution(
             resource_id=execution_id,
             remote_addr=client_ip(request),
             detail={"reason": "not_execution_owner", "attempted": action},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found"
+        )
+    return execution
+
+
+def _execution_for_logs(
+    execution_id: int,
+    principal: sessions.Principal,
+    *,
+    action: str,
+    request: HTTPConnection,
+):
+    """Load an execution whose transcripts the caller may read, or answer 404.
+
+    Separate from ``_owned_execution`` because run metadata and run output are two
+    different disclosures: an execution's row says what ran and whether it worked,
+    while a transcript contains command output, hostnames and anything a script
+    printed. ``log_visibility`` therefore governs this path only.
+
+    A private execution (the default, and every execution that predates the column)
+    is owner-only, so this is exactly ``_owned_execution`` for existing data. A
+    public *workflow* does not widen this: publishing a definition must not publish
+    the output of runs against its hosts, which is why the decision is made from the
+    execution's own ``log_visibility`` rather than the workflow's ``visibility``.
+    """
+    execution = execution_state.get_execution(execution_id)
+    allowed = execution is not None and permissions.can_read_logs(
+        owner_id=execution.created_by_id,
+        user_id=principal.user_id,
+        log_visibility=execution.log_visibility,
+        workflow_id=execution.workflow_id,
+    )
+    if not allowed:
+        audit.record(
+            AuditAction.ACCESS_DENIED,
+            actor_id=principal.user_id,
+            actor_username=principal.label,
+            session_id=principal.session_id,
+            outcome=AuditOutcome.DENIED,
+            resource_type="execution",
+            resource_id=execution_id,
+            remote_addr=client_ip(request),
+            detail={"reason": "log_visibility", "attempted": action},
         )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found"
@@ -399,7 +447,7 @@ def read_host_transcript(
     request: Request,
     principal: sessions.Principal = Depends(require_principal),
 ) -> HostTranscriptRead:
-    execution = _owned_execution(
+    execution = _execution_for_logs(
         execution_id, principal, action="read_transcript", request=request
     )
 
@@ -518,7 +566,7 @@ async def _authorize_stream(
         return None
 
     try:
-        execution = _owned_execution(
+        execution = _execution_for_logs(
             execution_id, principal, action="stream_transcript", request=websocket
         )
     except HTTPException as exc:

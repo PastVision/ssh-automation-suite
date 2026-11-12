@@ -150,8 +150,8 @@ class WorkflowBody:
     entries: tuple[Entry, ...] = ()
     variables: tuple[VariableData, ...] = ()
     hosts: tuple[HostData, ...] = ()
-    visibility: WorkflowVisibility = WorkflowVisibility.PRIVATE
-    execution_permission: ExecutionPermission = ExecutionPermission.OWNER_ONLY
+    visibility: WorkflowVisibility | None = None
+    execution_permission: ExecutionPermission | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +476,11 @@ def _replace_variables(
                 description=variable.description,
                 discovery_command=variable.discovery_command,
                 timeout_seconds=variable.timeout_seconds,
+                # Persisted together with the source: a user-defined variable keeps
+                # its frozen value and an empty discovery command, which is what the
+                # runner later branches on.
+                source=variable.source,
+                static_value=variable.static_value,
             )
         )
     session.flush()
@@ -526,6 +531,13 @@ def create(
             description=body.description,
             credential_id=body.credential_id,
             row_version=1,
+            # ``WorkflowCreate`` always supplies a value, so the fallbacks here only
+            # cover a service-level caller that omitted them. They stay on the safe
+            # side: private and owner-only.
+            visibility=body.visibility or WorkflowVisibility.PRIVATE,
+            execution_permission=(
+                body.execution_permission or ExecutionPermission.OWNER_ONLY
+            ),
         )
         session.add(workflow)
         session.flush()
@@ -607,6 +619,25 @@ def update(
         workflow.name = body.name.strip()
         workflow.description = body.description
         workflow.credential_id = body.credential_id
+
+        # Only an explicitly supplied value changes sharing. ``None`` means the client
+        # did not mention it, so the current setting survives -- otherwise every save
+        # from an older client would silently re-privatise a shared workflow, or worse,
+        # widen one.
+        revoke_grants = False
+        if body.visibility is not None and body.visibility != workflow.visibility:
+            workflow.visibility = body.visibility
+            # Switching back to private drops the existing grants, so a stale share
+            # cannot come back to life if the workflow is published again. Done after
+            # the commit below: ``revoke_all`` owns its own transaction, and committing
+            # a second session while this one holds a write lock would deadlock SQLite.
+            revoke_grants = body.visibility is WorkflowVisibility.PRIVATE
+        if (
+            body.execution_permission is not None
+            and body.execution_permission != workflow.execution_permission
+        ):
+            workflow.execution_permission = body.execution_permission
+
         workflow.row_version += 1
 
         _replace_entries(session, workflow, body)
@@ -623,6 +654,11 @@ def update(
         raise
     finally:
         session.close()
+
+    if revoke_grants:
+        # After the commit and with the write lock released, so this second
+        # transaction cannot collide with the update above.
+        permissions.revoke_all(RESOURCE, workflow_id)
 
     audit.record(
         AuditAction.RESOURCE_UPDATED,
@@ -925,6 +961,18 @@ def launch(
     attributed to a human who did not press anything.
     """
     workflow = get(workflow_id, principal)
+
+    # Viewing a workflow never implies permission to run it. ``require_run`` is the
+    # same rule ``can_run`` reports to the UI, so the button and the server agree.
+    # Checked immediately after loading, before any credential or host work, so a
+    # rejected launch cannot reach an SSH connection.
+    permissions.require_run(
+        workflow_id=workflow.id,
+        owner_id=workflow.owner_id,
+        user_id=principal.user_id,
+        execution_permission=workflow.execution_permission,
+    )
+
     if workflow.credential_id is None:
         raise WorkflowInvalid("This workflow has no SSH credential, so it cannot run.")
     if not workflow.hosts:

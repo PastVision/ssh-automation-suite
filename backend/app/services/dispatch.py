@@ -214,6 +214,14 @@ def dispatch(
         return _finish(
             session, ledger, ScheduleRunOutcome.INVALID_WORKFLOW, str(exc)
         )
+    except permissions.NotAuthorized as exc:
+        # ``launch`` re-checks run permission itself; reaching here means the
+        # decision changed between ``_authorize`` and the savepoint. Recorded as
+        # unauthorized rather than an error, because the schedule is intact and the
+        # next firing may succeed once permissions are restored.
+        return _finish(
+            session, ledger, ScheduleRunOutcome.UNAUTHORIZED, str(exc)
+        )
     except Exception as exc:  # noqa: BLE001 - recorded, never re-raised into APScheduler
         session.rollback()
         logger.exception("Scheduled dispatch failed for schedule %s", schedule_id)
@@ -299,6 +307,22 @@ def _authorize(
         return (
             ScheduleRunOutcome.UNAUTHORIZED,
             "The schedule's owner can no longer access this workflow.",
+        )
+    # A schedule runs with its owner's rights, so it is bound by the same
+    # ``execution_permission`` rule as a manual run. Ownership or sharing can change
+    # after the schedule was created, which would otherwise leave a schedule firing
+    # SSH work its owner is no longer allowed to start. ``launch`` enforces this too;
+    # checking here records the decision on the ledger instead of surfacing as an
+    # error after a savepoint rollback.
+    if not permissions.can_run_workflow(
+        workflow_id=workflow.id,
+        owner_id=workflow.owner_id,
+        user_id=actor.user_id,
+        execution_permission=workflow.execution_permission,
+    ):
+        return (
+            ScheduleRunOutcome.UNAUTHORIZED,
+            "The schedule's owner is no longer permitted to run this workflow.",
         )
     return None
 

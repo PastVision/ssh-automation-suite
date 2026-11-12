@@ -44,6 +44,7 @@ import {
   useUpdateTemplate,
 } from '@/hooks/use-templates'
 import type { TemplateDetail, TemplateSummary } from '@/lib/types'
+import { formatApiInstant } from '@/lib/display'
 
 export function TemplatesPage() {
   const [search, setSearch] = useState('')
@@ -290,7 +291,7 @@ function TemplateCard({
             {template.step_count} step{template.step_count === 1 ? '' : 's'}
           </span>
           <span>·</span>
-          <span>edited {new Date(template.updated_at).toLocaleDateString()}</span>
+          <span>edited {formatApiInstant(template.updated_at)}</span>
           {locked && (
             <span className="ml-auto inline-flex items-center gap-1 text-amber-700 dark:text-amber-300">
               <Lock className="size-3" />

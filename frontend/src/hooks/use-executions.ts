@@ -7,10 +7,11 @@
  * so a calm history page makes no requests.
  */
 
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiFetch } from '@/lib/api-client'
+import { ApiError, apiFetch } from '@/lib/api-client'
 import type {
+  CancelResponse,
   ExecutionDetail,
   ExecutionListResponse,
   ExecutionStatus,
@@ -18,6 +19,11 @@ import type {
 } from '@/lib/types'
 
 const LIST_KEY = ['executions'] as const
+
+/** Statuses a cancellation request can still act on. */
+export function isCancellable(status: ExecutionStatus): boolean {
+  return status === 'pending' || status === 'running'
+}
 
 export function executionKey(id: number) {
   return ['executions', id] as const
@@ -64,5 +70,42 @@ export function useHostTranscript(executionId: number, hostRunId: number | null)
       ),
     enabled: hostRunId !== null,
     staleTime: 2_000,
+  })
+}
+
+/**
+ * Why a cancellation request failed, in terms an operator can act on.
+ *
+ * A repeated click is not an error: the backend records the request once and
+ * answers `cancel_requested: false` while the run is still live, so only a
+ * genuine transport or permission failure reaches here.
+ */
+export function describeCancelError(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 404) return 'This run no longer exists.'
+    if (error.status === 403) return 'You do not have permission to cancel this run.'
+    if (error.status === 0) return 'The request timed out. Check the run state and retry.'
+    return error.detail ?? 'Could not cancel this run.'
+  }
+  return 'Could not cancel this run.'
+}
+
+/**
+ * Request cancellation for a run.
+ *
+ * Deliberately does not assume the run stops: the request is cooperative, so the
+ * detail is invalidated and the existing poll decides when the status actually
+ * changes. Both the detail and the list are refreshed because the list shows the
+ * same status.
+ */
+export function useCancelExecution() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) =>
+      apiFetch<CancelResponse>(`/api/executions/${id}/cancel`, { method: 'POST' }),
+    onSettled: (_data, _error, id) => {
+      void queryClient.invalidateQueries({ queryKey: executionKey(id) })
+      void queryClient.invalidateQueries({ queryKey: LIST_KEY })
+    },
   })
 }

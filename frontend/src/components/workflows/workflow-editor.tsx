@@ -32,13 +32,16 @@ import { useCredentials } from '@/hooks/use-credentials'
 import { useTemplates } from '@/hooks/use-templates'
 import { useWorkflowLock } from '@/hooks/use-workflows'
 import type {
+  ExecutionPermission,
   RunAsMethod,
+  VariableSource,
   WorkflowCreate,
   WorkflowDetail,
   WorkflowEntryInput,
   WorkflowHost,
   WorkflowUpdate,
   WorkflowVariable,
+  WorkflowVisibility,
 } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
@@ -74,7 +77,14 @@ interface DraftHost {
 interface DraftVariable {
   key: string
   name: string
+  source: VariableSource
   discovery_command: string
+  /**
+   * Always a string, so an empty box sends `""` -- which the backend accepts as
+   * a real value for a user-defined variable and never stores as null. A
+   * command-backed variable sends `null` here instead (see `toVariables`).
+   */
+  static_value: string
   description: string
   timeout_seconds: string
 }
@@ -83,6 +93,8 @@ export interface EditorState {
   name: string
   description: string
   credentialId: string
+  visibility: WorkflowVisibility
+  executionPermission: ExecutionPermission
   entries: DraftEntry[]
   hosts: DraftHost[]
   variables: DraftVariable[]
@@ -115,6 +127,8 @@ export function initialEditor(workflow: WorkflowDetail | null): EditorState {
       name: '',
       description: '',
       credentialId: '',
+      visibility: 'private',
+      executionPermission: 'owner_only',
       entries: [emptyTemplateEntry()],
       hosts: [],
       variables: [],
@@ -124,6 +138,8 @@ export function initialEditor(workflow: WorkflowDetail | null): EditorState {
     name: workflow.name,
     description: workflow.description ?? '',
     credentialId: workflow.credential_id === null ? '' : String(workflow.credential_id),
+    visibility: workflow.visibility,
+    executionPermission: workflow.execution_permission,
     entries: workflow.entries.map((entry) =>
       entry.kind === 'template'
         ? {
@@ -148,7 +164,9 @@ export function initialEditor(workflow: WorkflowDetail | null): EditorState {
     variables: workflow.variables.map((variable) => ({
       key: nextKey('var'),
       name: variable.name,
+      source: variable.source,
       discovery_command: variable.discovery_command,
+      static_value: variable.static_value ?? '',
       description: variable.description ?? '',
       timeout_seconds: String(variable.timeout_seconds),
     })),
@@ -216,13 +234,21 @@ export function validateWorkflow(state: EditorState): string | null {
   for (const variable of state.variables) {
     const name = variable.name.trim()
     if (!VARIABLE_NAME.test(name)) {
-      return `Variable name "${name}" is not valid: use letters, digits and underscore, starting with a letter or underscore.`
+      // Named after the row's position and its current text, so the operator can
+      // find the offending field without counting: a fresh, untouched row must
+      // not read as an error about "" being malformed.
+      return `Variable ${describeVariable(variable)} has an invalid name: use letters, digits and underscore, starting with a letter or underscore, at most 64 characters.`
     }
     if (seenVariables.has(name)) return `Variable "${name}" is defined more than once.`
     seenVariables.add(name)
-    if (!variable.discovery_command.trim()) {
-      return `Variable "${name}" needs a discovery command.`
+
+    // Only the field the chosen source actually uses is validated. A stale
+    // discovery command on a user-defined variable is irrelevant, and requiring
+    // one there was what made switching source impossible.
+    if (variable.source === 'command_output' && !variable.discovery_command.trim()) {
+      return `Variable "${name}" discovers its value from command output, so it needs a discovery command.`
     }
+
     const timeout = Number(variable.timeout_seconds)
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) {
       return `Variable "${name}" needs a timeout of 1-3600 seconds.`
@@ -230,6 +256,13 @@ export function validateWorkflow(state: EditorState): string | null {
   }
 
   return null
+}
+
+/** How to name a variable in a message when its own name may be unusable. */
+function describeVariable(variable: DraftVariable): string {
+  const name = variable.name.trim()
+  if (name) return `"${name}"`
+  return variable.key.replace('var-', '#')
 }
 
 function toEntries(state: EditorState): WorkflowEntryInput[] {
@@ -255,7 +288,13 @@ function toHosts(state: EditorState): WorkflowHost[] {
 function toVariables(state: EditorState): WorkflowVariable[] {
   return state.variables.map((variable) => ({
     name: variable.name.trim(),
-    discovery_command: variable.discovery_command,
+    source: variable.source,
+    // Each source sends only its own field as meaningful: the backend stores
+    // both columns, and a leftover value in the unused one would be confusing
+    // in history even though it is never read.
+    discovery_command:
+      variable.source === 'command_output' ? variable.discovery_command : '',
+    static_value: variable.source === 'user_defined' ? variable.static_value : null,
     description: variable.description.trim() ? variable.description.trim() : null,
     timeout_seconds: Number(variable.timeout_seconds),
   }))
@@ -269,6 +308,8 @@ export function toCreatePayload(state: EditorState): WorkflowCreate {
     entries: toEntries(state),
     variables: toVariables(state),
     hosts: toHosts(state),
+    visibility: state.visibility,
+    execution_permission: state.executionPermission,
   }
 }
 
@@ -493,6 +534,58 @@ export function WorkflowEditor({
             />
           </label>
 
+          {/*
+            Visibility and the run permission are separate fields because they
+            answer different questions: who can see the definition, and who may
+            execute it. The backend enforces both, so the copy states exactly what
+            each choice grants rather than implying one implies the other.
+          */}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="space-y-1 text-sm">
+              <span className="font-medium">Visibility</span>
+              <select
+                className={inputClass}
+                value={state.visibility}
+                onChange={(event) =>
+                  patch({ visibility: event.target.value as WorkflowVisibility })
+                }
+                aria-label="Workflow visibility"
+              >
+                <option value="private">Private — only me</option>
+                <option value="public">Public — every signed-in user</option>
+              </select>
+              <span className="text-muted-foreground block text-xs">
+                {state.visibility === 'private'
+                  ? 'Only you can see this workflow and its runs.'
+                  : 'Anyone signed in can see the definition. Running it still needs the permission below.'}
+              </span>
+            </label>
+            <label className="space-y-1 text-sm">
+              <span className="font-medium">Who may run it</span>
+              <select
+                className={inputClass}
+                value={state.executionPermission}
+                onChange={(event) =>
+                  patch({
+                    executionPermission: event.target.value as ExecutionPermission,
+                  })
+                }
+                aria-label="Workflow execution permission"
+              >
+                <option value="owner_only">Only the owner</option>
+                <option value="selected">Selected users</option>
+                <option value="all_authenticated">Any signed-in user</option>
+              </select>
+              <span className="text-muted-foreground block text-xs">
+                {state.executionPermission === 'owner_only'
+                  ? 'Shared viewers can read the workflow but cannot start a run.'
+                  : state.executionPermission === 'selected'
+                    ? 'Grants are managed by the workflow owner; viewers without a grant see a disabled Run button.'
+                    : 'Everyone who can see this workflow can start a run with its credential.'}
+              </span>
+            </label>
+          </div>
+
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-sm font-medium">
               Entries
@@ -714,7 +807,7 @@ export function WorkflowEditor({
               <h3 className="text-sm font-medium">
                 Variables
                 <span className="text-muted-foreground ml-2 text-xs font-normal">
-                  discovered once per host, then rendered as {'{{ name }}'}
+                  resolved once per host, then rendered as {'{{ name }}'}
                 </span>
               </h3>
               <Button
@@ -728,7 +821,9 @@ export function WorkflowEditor({
                       {
                         key: nextKey('var'),
                         name: '',
+                        source: 'command_output' as const,
                         discovery_command: '',
+                        static_value: '',
                         description: '',
                         timeout_seconds: '30',
                       },
@@ -746,80 +841,141 @@ export function WorkflowEditor({
               </p>
             ) : (
               <div className="space-y-2">
-                {state.variables.map((variable, index) => (
-                  <div key={variable.key} className="bg-card rounded-lg border p-3">
-                    <div className="grid gap-2 sm:grid-cols-[1fr_5rem_auto]">
-                      <label className="space-y-1 text-xs">
-                        <span className="text-muted-foreground">Name</span>
-                        <input
-                          className={inputClass}
-                          value={variable.name}
-                          onChange={(event) =>
-                            updateVariable(index, { name: event.target.value })
-                          }
-                          placeholder="hostname_fqdn"
-                          aria-label={`Variable ${index + 1} name`}
-                        />
-                      </label>
-                      <label className="space-y-1 text-xs">
-                        <span className="text-muted-foreground">Timeout</span>
-                        <input
-                          className={inputClass}
-                          value={variable.timeout_seconds}
-                          inputMode="numeric"
-                          onChange={(event) =>
-                            updateVariable(index, { timeout_seconds: event.target.value })
-                          }
-                          aria-label={`Variable ${index + 1} timeout`}
-                        />
-                      </label>
-                      <div className="flex items-end">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Remove variable ${index + 1}`}
-                          onClick={() =>
-                            patch({
-                              variables: state.variables.filter(
-                                (_, at) => at !== index,
-                              ),
-                            })
-                          }
-                        >
-                          <Trash2 />
-                        </Button>
+                {state.variables.map((variable, index) => {
+                  const nameProblem =
+                    variable.name.trim() !== '' && !VARIABLE_NAME.test(variable.name.trim())
+                  return (
+                    <div key={variable.key} className="bg-card rounded-lg border p-3">
+                      <div className="grid gap-2 sm:grid-cols-[1fr_9rem_5rem_auto]">
+                        <label className="space-y-1 text-xs">
+                          <span className="text-muted-foreground">Name</span>
+                          <input
+                            className={cn(inputClass, nameProblem && 'border-destructive')}
+                            value={variable.name}
+                            maxLength={64}
+                            aria-invalid={nameProblem || undefined}
+                            onChange={(event) =>
+                              updateVariable(index, { name: event.target.value })
+                            }
+                            placeholder="hostname_fqdn"
+                            aria-label={`Variable ${index + 1} name`}
+                          />
+                          {nameProblem ? (
+                            <span className="text-destructive block">
+                              Letters, digits and underscore only.
+                            </span>
+                          ) : null}
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span className="text-muted-foreground">Source</span>
+                          <select
+                            className={inputClass}
+                            value={variable.source}
+                            onChange={(event) =>
+                              updateVariable(index, {
+                                source: event.target.value as VariableSource,
+                              })
+                            }
+                            aria-label={`Variable ${index + 1} source`}
+                          >
+                            <option value="command_output">Command output</option>
+                            <option value="user_defined">Fixed value</option>
+                          </select>
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span className="text-muted-foreground">Timeout</span>
+                          <input
+                            className={inputClass}
+                            value={variable.timeout_seconds}
+                            inputMode="numeric"
+                            onChange={(event) =>
+                              updateVariable(index, {
+                                timeout_seconds: event.target.value,
+                              })
+                            }
+                            aria-label={`Variable ${index + 1} timeout`}
+                          />
+                        </label>
+                        <div className="flex items-end">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Remove variable ${index + 1}`}
+                            onClick={() =>
+                              patch({
+                                variables: state.variables.filter(
+                                  (_, at) => at !== index,
+                                ),
+                              })
+                            }
+                          >
+                            <Trash2 />
+                          </Button>
+                        </div>
                       </div>
+
+                      {/*
+                        Only the active source's field is rendered, so a value the
+                        backend would ignore is never shown as if it applied. The
+                        inactive value is still kept in the draft, so switching
+                        back and forth loses nothing.
+                      */}
+                      {variable.source === 'command_output' ? (
+                        <label className="mt-2 block space-y-1 text-xs">
+                          <span className="text-muted-foreground">Discovery command</span>
+                          <input
+                            className={cn(inputClass, 'font-mono')}
+                            value={variable.discovery_command}
+                            onChange={(event) =>
+                              updateVariable(index, {
+                                discovery_command: event.target.value,
+                              })
+                            }
+                            placeholder="hostname -f"
+                            spellCheck={false}
+                            aria-label={`Variable ${index + 1} discovery command`}
+                          />
+                          <span className="text-muted-foreground block">
+                            Run on each host once per execution; its trimmed output
+                            becomes the value.
+                          </span>
+                        </label>
+                      ) : (
+                        <label className="mt-2 block space-y-1 text-xs">
+                          <span className="text-muted-foreground">Value</span>
+                          <input
+                            className={cn(inputClass, 'font-mono')}
+                            value={variable.static_value}
+                            onChange={(event) =>
+                              updateVariable(index, { static_value: event.target.value })
+                            }
+                            placeholder="Sent to every host as-is"
+                            spellCheck={false}
+                            aria-label={`Variable ${index + 1} value`}
+                          />
+                          <span className="text-muted-foreground block">
+                            The same value on every host. An empty value is allowed and
+                            stays empty rather than falling back to discovery.
+                          </span>
+                        </label>
+                      )}
+
+                      <label className="mt-2 block space-y-1 text-xs">
+                        <span className="text-muted-foreground">Description</span>
+                        <input
+                          className={inputClass}
+                          value={variable.description}
+                          onChange={(event) =>
+                            updateVariable(index, { description: event.target.value })
+                          }
+                          placeholder="Fully qualified hostname"
+                          aria-label={`Variable ${index + 1} description`}
+                        />
+                      </label>
                     </div>
-                    <label className="mt-2 block space-y-1 text-xs">
-                      <span className="text-muted-foreground">Discovery command</span>
-                      <input
-                        className={cn(inputClass, 'font-mono')}
-                        value={variable.discovery_command}
-                        onChange={(event) =>
-                          updateVariable(index, {
-                            discovery_command: event.target.value,
-                          })
-                        }
-                        placeholder="hostname -f"
-                        spellCheck={false}
-                        aria-label={`Variable ${index + 1} discovery command`}
-                      />
-                    </label>
-                    <label className="mt-2 block space-y-1 text-xs">
-                      <span className="text-muted-foreground">Description</span>
-                      <input
-                        className={inputClass}
-                        value={variable.description}
-                        onChange={(event) =>
-                          updateVariable(index, { description: event.target.value })
-                        }
-                        placeholder="Fully qualified hostname"
-                        aria-label={`Variable ${index + 1} description`}
-                      />
-                    </label>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>

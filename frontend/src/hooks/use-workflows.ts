@@ -43,6 +43,13 @@ export function useWorkflows(search: string) {
     queryKey: [...LIST_KEY, search.trim()],
     queryFn: () => apiFetch<WorkflowListResponse>(`/api/workflows${suffix}`),
     staleTime: 10_000,
+    // The active count comes from the database, so it is already correct after a
+    // refresh or a restart. Polling only while something is running keeps a calm
+    // page silent, and makes the badge clear itself once the last run settles.
+    refetchInterval: (query) =>
+      query.state.data?.items.some((item) => item.active_execution_count > 0)
+        ? 5_000
+        : false,
   })
 }
 
@@ -95,12 +102,19 @@ export function useDeleteWorkflow() {
  * re-runs only the hosts that failed.
  */
 export function useRunWorkflow() {
+  const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (input: { id: number; hostnames?: string[] | null }) =>
       apiFetch<WorkflowRunResponse>(
         `/api/workflows/${input.id}/run`,
         jsonInit(input.hostnames ? { hostnames: input.hostnames } : {}),
       ),
+    // A new run changes the workflow's active count, which the card shows. Only
+    // the list is refreshed -- never the workflow detail, so an editor open at
+    // the same time cannot be made to look stale by somebody pressing Run.
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: LIST_KEY })
+    },
   })
 }
 

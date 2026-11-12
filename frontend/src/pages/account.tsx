@@ -16,12 +16,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useAuditEvents } from '@/hooks/use-audit'
 import { useEndSession, useSessions } from '@/hooks/use-sessions'
 import { useAuth } from '@/lib/auth'
+import { formatApiInstant } from '@/lib/display'
 
 function formatWhen(iso: string | null): string {
-  if (!iso) return '—'
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return iso
-  return parsed.toLocaleString()
+  // Via `formatApiInstant`, not `new Date(iso)`: the API sends offset-less UTC,
+  // which `Date` would read as local time.
+  return formatApiInstant(iso)
 }
 
 

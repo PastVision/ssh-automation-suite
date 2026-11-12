@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog'
 import { Notice } from '@/components/templates/template-editor'
 import { useVersion } from '@/hooks/use-templates'
+import { formatApiInstant } from '@/lib/display'
 import type { TemplateDetail, TemplateVersionSummary } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
@@ -151,7 +152,7 @@ export function VersionHistory({ open, template, onOpenChange }: VersionHistoryP
                     {version.step_count} step{version.step_count === 1 ? '' : 's'}
                   </span>
                   <span className="ml-auto text-xs text-muted-foreground">
-                    {new Date(version.created_at).toLocaleDateString()}
+                    {formatApiInstant(version.created_at)}
                   </span>
                 </Button>
               </li>

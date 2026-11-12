@@ -66,6 +66,8 @@ def _steps_from(payload: list[TemplateStepInput]) -> tuple[templates.StepData, .
             interpreter=item.interpreter,
             timeout_seconds=item.timeout_seconds,
             rule=_rule_from(item.rule),
+            run_as_username=item.run_as_username,
+            run_as_method=item.run_as_method,
         )
         for item in payload
     )
@@ -191,6 +193,8 @@ def _detail(template: Template, principal: Principal) -> TemplateDetail:
                 interpreter=step.interpreter,
                 timeout_seconds=step.timeout_seconds,
                 rule=_rule_read(step),
+                run_as_username=step.run_as_username,
+                run_as_method=step.run_as_method,
             )
             for step in (latest.steps if latest else [])
         ],
@@ -496,6 +500,8 @@ def read_version(
                 interpreter=step.interpreter,
                 timeout_seconds=step.timeout_seconds,
                 rule=_rule_read(step),
+                run_as_username=step.run_as_username,
+                run_as_method=step.run_as_method,
             )
             for step in version.steps
         ],

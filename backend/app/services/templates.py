@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.db.session import get_session_factory
 from app.db.types import utcnow
 from app.models.audit_actions import AuditAction
+from app.models.enums import RunAsMethod
 from app.models.permission import (
     PermissionLevel,
     ResourceLock,
@@ -72,6 +73,8 @@ class StepData:
     interpreter: str = "bash"
     timeout_seconds: int = 300
     rule: StepRule = field(default_factory=StepRule)
+    run_as_username: str | None = None
+    run_as_method: RunAsMethod | None = None
 
 
 @dataclass(frozen=True)
@@ -85,9 +88,10 @@ class TemplateBody:
     def steps_as_dicts(self) -> list[dict[str, object]]:
         """Canonical payload for ``compute_content_checksum``.
 
-        ``rule`` is added only when a step is conditional, so the digest of a
-        template that never used execution rules is unchanged from the previous
-        milestone -- an upgrade must not make a no-op save append a version.
+        ``rule`` and the Run-As pair are added only when a step actually uses
+        them, so the digest of a template that never did is unchanged from the
+        previous milestone -- an upgrade must not make a no-op save append a
+        version.
         """
         payload: list[dict[str, object]] = []
         for step in self.steps:
@@ -101,6 +105,11 @@ class TemplateBody:
             rule = step.rule.as_dict()
             if rule is not None:
                 entry["rule"] = rule
+            if step.run_as_username is not None:
+                entry["run_as_username"] = step.run_as_username
+                entry["run_as_method"] = (
+                    step.run_as_method.value if step.run_as_method is not None else None
+                )
             payload.append(entry)
         return payload
 
@@ -289,6 +298,8 @@ def _append_version(
             script=step.script,
             interpreter=step.interpreter.strip(),
             timeout_seconds=step.timeout_seconds,
+            run_as_username=step.run_as_username,
+            run_as_method=step.run_as_method,
         )
         row.set_rule(step.rule)
         session.add(row)
@@ -310,6 +321,8 @@ def _body_from(template: Template, latest: TemplateVersion | None) -> TemplateBo
                 interpreter=step.interpreter,
                 timeout_seconds=step.timeout_seconds,
                 rule=step.to_rule(),
+                run_as_username=step.run_as_username,
+                run_as_method=step.run_as_method,
             )
             for step in latest.steps
         ),

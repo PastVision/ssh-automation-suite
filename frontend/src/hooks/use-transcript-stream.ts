@@ -22,6 +22,13 @@ const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000]
 
 export type StreamStatus = 'connecting' | 'live' | 'ended' | 'error'
 
+/** An execution-level change pushed over the same socket as the transcript. */
+export interface StatusUpdate {
+  status: string
+  reason: string | null
+  cancelRequestedAt: string | null
+}
+
 export interface TranscriptStream {
   status: StreamStatus
   content: string
@@ -32,6 +39,12 @@ export interface TranscriptStream {
   /** Bytes missing because a frame's range skipped past what we had. */
   missingBytes: number
   error: string | null
+  /**
+   * The newest execution-level event seen on this socket. The backend delivers
+   * status changes to transcript subscribers, which is how a cancelling run is
+   * noticed without polling the detail endpoint.
+   */
+  lastStatus: StatusUpdate | null
 }
 
 const INITIAL: TranscriptStream = {
@@ -41,6 +54,7 @@ const INITIAL: TranscriptStream = {
   droppedBytes: 0,
   missingBytes: 0,
   error: null,
+  lastStatus: null,
 }
 
 type Frame =
@@ -51,6 +65,12 @@ type Frame =
       reason: string
       dropped_bytes?: number
       missing_bytes?: number
+    }
+  | {
+      type: 'status'
+      status: string
+      reason?: string | null
+      cancel_requested_at?: string | null
     }
   | { type: 'end' }
 
@@ -141,6 +161,18 @@ export function useTranscriptStream(
             truncated: true,
             droppedBytes: current.droppedBytes + (frame.dropped_bytes ?? 0),
             missingBytes: current.missingBytes + (frame.missing_bytes ?? 0),
+          }))
+          return
+        }
+
+        if (frame.type === 'status') {
+          setStream((current) => ({
+            ...current,
+            lastStatus: {
+              status: frame.status,
+              reason: frame.reason ?? null,
+              cancelRequestedAt: frame.cancel_requested_at ?? null,
+            },
           }))
           return
         }

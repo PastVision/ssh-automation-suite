@@ -24,11 +24,12 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCredentials, useDeleteCredential } from '@/hooks/use-credentials'
 import { ApiError } from '@/lib/api-client'
+import { formatApiInstant } from '@/lib/display'
 import type { Credential, CredentialDeleteBlocked } from '@/lib/types'
 
 function formatDate(value: string): string {
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+  // Offset-less UTC from the API; `new Date(value)` would shift it by the viewer.
+  return formatApiInstant(value)
 }
 
 /**

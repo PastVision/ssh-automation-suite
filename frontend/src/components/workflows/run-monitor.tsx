@@ -8,14 +8,20 @@
  * interval stops as soon as the run reaches a terminal state.
  */
 
-import { ExternalLink, RefreshCw } from 'lucide-react'
+import { Ban, ExternalLink, RefreshCw } from 'lucide-react'
 
 import { StatusBadge } from '@/components/executions/status-badge'
 import { TranscriptDialog } from '@/components/executions/transcript-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useExecution } from '@/hooks/use-executions'
+import {
+  describeCancelError,
+  isCancellable,
+  useCancelExecution,
+  useExecution,
+} from '@/hooks/use-executions'
 import type { HostRun } from '@/lib/types'
 import { useState } from 'react'
 
@@ -28,10 +34,28 @@ export function RunMonitor({
 }) {
   const detail = useExecution(executionId)
   const [transcript, setTranscript] = useState<HostRun | null>(null)
+  const [confirming, setConfirming] = useState(false)
+  const [cancelError, setCancelError] = useState<string | null>(null)
+  const cancel = useCancelExecution()
 
   const execution = detail.data
   const active =
     execution?.status === 'pending' || execution?.status === 'running'
+  const cancelling =
+    execution?.cancel_requested_at != null && execution.status
+      ? isCancellable(execution.status)
+      : false
+  const cancellable = execution ? isCancellable(execution.status) && !cancelling : false
+
+  async function submitCancel() {
+    setCancelError(null)
+    try {
+      await cancel.mutateAsync(executionId)
+      setConfirming(false)
+    } catch (error) {
+      setCancelError(describeCancelError(error))
+    }
+  }
 
   return (
     <Card className="border-primary/30">
@@ -41,6 +65,11 @@ export function RunMonitor({
             <CardTitle className="flex items-center gap-2 text-base">
               Run #{executionId}
               {execution ? <StatusBadge status={execution.status} /> : null}
+              {cancelling ? (
+                <span className="text-warning text-xs font-normal">
+                  cancellation requested
+                </span>
+              ) : null}
             </CardTitle>
             <CardDescription>
               {execution
@@ -53,6 +82,24 @@ export function RunMonitor({
             </CardDescription>
           </div>
           <div className="flex items-center gap-1.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setCancelError(null)
+                setConfirming(true)
+              }}
+              disabled={!cancellable}
+              title={
+                cancellable
+                  ? 'Request cancellation'
+                  : cancelling
+                    ? 'Cancellation already requested'
+                    : 'This run has already finished'
+              }
+            >
+              <Ban /> {cancelling ? 'Cancelling…' : 'Cancel'}
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -150,6 +197,30 @@ export function RunMonitor({
         executionId={executionId}
         host={transcript}
         onClose={() => setTranscript(null)}
+      />
+
+      <ConfirmDialog
+        open={confirming}
+        title="Cancel this run?"
+        description={
+          execution
+            ? `This stops the run across its ${execution.host_count} host${
+                execution.host_count === 1 ? '' : 's'
+              }. A remote command already in flight finishes first, and hosts not yet started are skipped.`
+            : 'Cancellation is cooperative and may take a moment to take effect.'
+        }
+        confirmLabel="Cancel run"
+        cancelLabel="Keep running"
+        pending={cancel.isPending}
+        destructive
+        error={cancelError}
+        onConfirm={() => void submitCancel()}
+        onOpenChange={(open) => {
+          if (!open && !cancel.isPending) {
+            setConfirming(false)
+            setCancelError(null)
+          }
+        }}
       />
     </Card>
   )

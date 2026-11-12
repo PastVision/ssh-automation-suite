@@ -9,7 +9,7 @@
  * Workflows page becomes visible here without a manual refresh.
  */
 
-import { CalendarClock, ListChecks, RefreshCw } from 'lucide-react'
+import { Ban, CalendarClock, ListChecks, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 
 import { StatusBadge } from '@/components/executions/status-badge'
@@ -23,10 +23,18 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useExecution, useExecutions } from '@/hooks/use-executions'
+import {
+  describeCancelError,
+  isCancellable,
+  useCancelExecution,
+  useExecution,
+  useExecutions,
+} from '@/hooks/use-executions'
 import { formatApiInstant, parseApiInstant } from '@/lib/display'
-import type { ExecutionStatus, HostRun } from '@/lib/types'
+import { diagnoseSudoFailure } from '@/lib/sudo-diagnostics'
+import type { ExecutionStatus, HostRun, LogVisibility } from '@/lib/types'
 
 const FILTERS: Array<ExecutionStatus | 'all'> = [
   'all',
@@ -55,9 +63,11 @@ function formatDuration(start: string | null, end: string | null): string {
 function HostBreakdown({
   executionId,
   onOpenTranscript,
+  onRequestCancel,
 }: {
   executionId: number
   onOpenTranscript: (host: HostRun) => void
+  onRequestCancel: () => void
 }) {
   const detail = useExecution(executionId)
 
@@ -68,10 +78,28 @@ function HostBreakdown({
   const execution = detail.data
   if (!execution) return null
 
+  const cancelling =
+    execution.cancel_requested_at !== null && isCancellable(execution.status)
+  const cancellable = isCancellable(execution.status) && !cancelling
+
   return (
     <div className="space-y-3">
       {execution.error_message ? (
         <p className="text-destructive text-sm">{execution.error_message}</p>
+      ) : null}
+
+      {/*
+        The request is cooperative: the run keeps a non-terminal status until the
+        worker actually stops, so "requested" is shown separately from "cancelled"
+        rather than pretending the run is already over.
+      */}
+      {cancelling ? (
+        <p className="text-warning text-sm" role="status">
+          Cancellation requested
+          {execution.cancel_requested_by_id !== null ? ' by an operator' : ''} at{' '}
+          {formatDate(execution.cancel_requested_at)}. The run stops at the next
+          safe point.
+        </p>
       ) : null}
 
       {execution.hosts.length === 0 ? (
@@ -98,7 +126,7 @@ function HostBreakdown({
             </div>
 
             {host.error_message ? (
-              <p className="text-destructive mt-2 text-xs">{host.error_message}</p>
+              <HostFailure hostname={host.hostname} message={host.error_message} />
             ) : null}
 
             {host.steps.length > 0 ? (
@@ -130,6 +158,83 @@ function HostBreakdown({
           </div>
         ))
       )}
+
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-muted-foreground text-xs">
+          {cancellable
+            ? 'Cancelling asks the run to stop; in-flight remote commands finish first.'
+            : `Transcripts are ${describeLogVisibility(execution.log_visibility)}.`}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="text-destructive hover:text-destructive"
+          onClick={onRequestCancel}
+          disabled={!cancellable}
+          title={
+            cancellable
+              ? 'Request cancellation'
+              : cancelling
+                ? 'Cancellation already requested'
+                : 'This run has already finished'
+          }
+        >
+          <Ban /> {cancelling ? 'Cancelling…' : 'Cancel run'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Who can read this run's transcripts.
+ *
+ * Shown because it is a real access decision the operator cannot see anywhere
+ * else. There is no control for it: no route accepts a log-visibility change, so
+ * offering a dropdown here would be a button that cannot work.
+ */
+function describeLogVisibility(visibility: LogVisibility): string {
+  switch (visibility) {
+    case 'public':
+      return 'readable by every signed-in user'
+    case 'shared':
+      return 'readable by users this workflow is shared with'
+    default:
+      return 'readable only by you'
+  }
+}
+
+/**
+ * A host's failure, with the actionable part pulled out when the backend has
+ * already classified a privilege problem.
+ *
+ * The raw message is always shown: it is what the transcript footer says, and an
+ * operator comparing the two must not find different text. The diagnosis adds
+ * *what to change* next to it rather than replacing it.
+ */
+function HostFailure({
+  hostname,
+  message,
+}: {
+  hostname: string
+  message: string
+}) {
+  const diagnosis = diagnoseSudoFailure(message, hostname)
+  if (!diagnosis) {
+    return <p className="text-destructive mt-2 text-xs">{message}</p>
+  }
+  return (
+    <div className="border-destructive/40 bg-destructive/5 mt-2 rounded-md border p-2">
+      <p className="text-destructive text-xs font-medium">{diagnosis.summary}</p>
+      <p className="text-muted-foreground mt-1 text-xs">{diagnosis.action}</p>
+      <details className="mt-1">
+        <summary className="text-muted-foreground cursor-pointer text-xs underline underline-offset-2">
+          Backend message
+        </summary>
+        <p className="text-muted-foreground mt-1 text-xs whitespace-pre-wrap">
+          {message}
+        </p>
+      </details>
     </div>
   )
 }
@@ -141,9 +246,42 @@ export function ExecutionsPage() {
     executionId: number
     host: HostRun
   } | null>(null)
+  const [confirmCancel, setConfirmCancel] = useState<{
+    executionId: number
+    workflowName: string
+    hostCount: number
+  } | null>(null)
+  const [cancelError, setCancelError] = useState<string | null>(null)
 
   const list = useExecutions(filter)
   const items = list.data?.items ?? []
+  const cancel = useCancelExecution()
+
+  function openCancel(execution: {
+    id: number
+    workflow_name: string
+    host_count: number
+  }) {
+    setCancelError(null)
+    setConfirmCancel({
+      executionId: execution.id,
+      workflowName: execution.workflow_name,
+      hostCount: execution.host_count,
+    })
+  }
+
+  async function submitCancel() {
+    if (!confirmCancel) return
+    setCancelError(null)
+    try {
+      await cancel.mutateAsync(confirmCancel.executionId)
+      setConfirmCancel(null)
+    } catch (error) {
+      // Kept open with the reason so the operator can decide what to do next
+      // instead of losing the dialog and guessing why nothing happened.
+      setCancelError(describeCancelError(error))
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -246,6 +384,7 @@ export function ExecutionsPage() {
                       onOpenTranscript={(host) =>
                         setTranscript({ executionId: execution.id, host })
                       }
+                      onRequestCancel={() => openCancel(execution)}
                     />
                   </div>
                 ) : null}
@@ -259,6 +398,30 @@ export function ExecutionsPage() {
         executionId={transcript?.executionId ?? 0}
         host={transcript?.host ?? null}
         onClose={() => setTranscript(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmCancel !== null}
+        title="Cancel this run?"
+        description={
+          confirmCancel
+            ? `Run #${confirmCancel.executionId} ("${confirmCancel.workflowName}") is targeting ${confirmCancel.hostCount} host${
+                confirmCancel.hostCount === 1 ? '' : 's'
+              }. Cancellation is cooperative: a remote command already running finishes before that host stops, and hosts not yet started are skipped.`
+            : ''
+        }
+        confirmLabel="Cancel run"
+        cancelLabel="Keep running"
+        pending={cancel.isPending}
+        destructive
+        error={cancelError}
+        onConfirm={() => void submitCancel()}
+        onOpenChange={(open) => {
+          if (!open && !cancel.isPending) {
+            setConfirmCancel(null)
+            setCancelError(null)
+          }
+        }}
       />
     </div>
   )

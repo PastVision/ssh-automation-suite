@@ -9,7 +9,19 @@
  * longer matches the backend.
  */
 
-import { CalendarClock, GitBranch, Pencil, Play, Plus, RefreshCw, Search, Trash2, Users } from 'lucide-react'
+import {
+  Activity,
+  CalendarClock,
+  GitBranch,
+  Globe,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Trash2,
+  Users,
+} from 'lucide-react'
 import { useState } from 'react'
 
 import { ScheduleManagerDialog } from '@/components/schedules/schedule-manager-dialog'
@@ -28,6 +40,7 @@ import {
   useWorkflows,
 } from '@/hooks/use-workflows'
 import type { WorkflowCreate, WorkflowSummary, WorkflowUpdate } from '@/lib/types'
+import { formatApiInstant } from '@/lib/display'
 
 export function WorkflowsPage() {
   const [search, setSearch] = useState('')
@@ -239,16 +252,47 @@ function WorkflowCard({
   onSchedules,
   running,
 }: WorkflowCardProps) {
+  const activeCount = workflow.active_execution_count
+  const isActive = activeCount > 0
+
+  // "May I run this?" and "is it runnable at all?" are separate questions: the
+  // first is a permission the backend enforces, the second is a precondition a
+  // user can fix. Both are explained in the tooltip so a disabled button never
+  // leaves the operator guessing.
+  const canRun = workflow.can_run && workflow.host_count > 0
+  const runBlockedReason = !workflow.can_run
+    ? 'You do not have permission to run this workflow'
+    : workflow.host_count === 0
+      ? 'Add at least one host before running'
+      : 'Run this workflow now'
+
   return (
     <Card className="flex flex-col">
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <CardTitle className="text-base leading-tight">{workflow.name}</CardTitle>
-          {!workflow.is_owner && (
-            <Badge variant="outline" className="shrink-0">
-              <Users className="size-3" /> shared
-            </Badge>
-          )}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {/*
+              The count is the database's, not a local "I pressed Run" flag, so it
+              survives a refresh and shows runs started by anyone or by a schedule.
+            */}
+            {isActive && (
+              <Badge variant="warning" title="Runs currently in progress">
+                <Activity className="size-3" />
+                {activeCount === 1 ? '1 running' : `${activeCount} running`}
+              </Badge>
+            )}
+            {workflow.visibility === 'public' && (
+              <Badge variant="outline" className="shrink-0">
+                <Globe className="size-3" /> public
+              </Badge>
+            )}
+            {!workflow.is_owner && (
+              <Badge variant="outline" className="shrink-0">
+                <Users className="size-3" /> shared
+              </Badge>
+            )}
+          </div>
         </div>
         <CardDescription className="line-clamp-2 min-h-8">
           {workflow.description || 'No description'}
@@ -267,18 +311,22 @@ function WorkflowCard({
           <span>
             {workflow.host_count} host{workflow.host_count === 1 ? '' : 's'}
           </span>
+          {/*
+            `last_run_at` is never populated by the backend, so it is shown only
+            when it actually carries a value. Rendering "never run" for it would
+            be a lie about a workflow that ran a minute ago.
+          */}
+          {workflow.last_run_at ? (
+            <span>last run {formatApiInstant(workflow.last_run_at)}</span>
+          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
           <Button
             size="sm"
             onClick={onRun}
-            disabled={running || workflow.host_count === 0}
-            title={
-              workflow.host_count === 0
-                ? 'Add at least one host before running'
-                : 'Run this workflow now'
-            }
+            disabled={running || !canRun}
+            title={runBlockedReason}
           >
             <Play /> {running ? 'Starting…' : 'Run'}
           </Button>

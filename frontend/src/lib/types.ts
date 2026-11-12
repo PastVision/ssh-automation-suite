@@ -221,6 +221,13 @@ export interface TemplateStep {
   interpreter: string
   timeout_seconds: number
   rule: StepRule
+  /**
+   * Per-step Run-As. `null` means the step runs as the SSH login user, which is
+   * what an empty field means. `run_as_method` is only meaningful when a
+   * username is set.
+   */
+  run_as_username: string | null
+  run_as_method: RunAsMethod | null
 }
 export interface TemplateStepInput {
   name: string
@@ -229,6 +236,8 @@ export interface TemplateStepInput {
   interpreter: string
   timeout_seconds: number
   rule?: StepRuleInput
+  run_as_username?: string | null
+  run_as_method?: RunAsMethod | null
 }
 export interface TemplateVersionSummary {
   id: number
@@ -331,6 +340,19 @@ export interface CredentialDeleteBlocked {
 /** Mirrors `RunAsMethod`: how the target user is reached via sudo. */
 export type RunAsMethod = 'nopasswd' | 'password'
 
+/** Mirrors `WorkflowVisibility`. Private is the default and the safe one. */
+export type WorkflowVisibility = 'private' | 'public'
+/**
+ * Mirrors `ExecutionPermission`. Deliberately separate from visibility: being
+ * able to *see* a workflow never implies being able to *run* it.
+ */
+export type ExecutionPermission = 'owner_only' | 'selected' | 'all_authenticated'
+/**
+ * Mirrors `LogVisibility`. Separate from both: publishing a workflow must not
+ * publish the output of runs that already happened.
+ */
+export type LogVisibility = 'private' | 'shared' | 'public'
+
 /** One entry of a workflow body. Position is array order, not a field. */
 export interface WorkflowTemplateEntry {
   kind: 'template'
@@ -352,9 +374,20 @@ export interface WorkflowRunAsEntry {
 }
 export type WorkflowEntry = WorkflowTemplateEntry | WorkflowRunAsEntry
 
+/**
+ * Mirrors `VariableSource`. The backend decides behaviour from this field, not
+ * from whether the command looks empty, so the editor must send it explicitly:
+ * a user-defined variable with an empty value is still user-defined.
+ */
+export type VariableSource = 'command_output' | 'user_defined'
+
 export interface WorkflowVariable {
   name: string
+  source: VariableSource
+  /** Only meaningful for `command_output`; empty for `user_defined`. */
   discovery_command: string
+  /** Only meaningful for `user_defined`; may legitimately be `""`. */
+  static_value: string | null
   description: string | null
   timeout_seconds: number
 }
@@ -371,10 +404,21 @@ export interface WorkflowSummary {
   row_version: number
   can_edit: boolean
   is_owner: boolean
+  /** Running requires this, not `can_edit`: the two are independent. */
+  can_run: boolean
+  visibility: WorkflowVisibility
+  execution_permission: ExecutionPermission
   step_count: number
   run_as_count: number
   variable_count: number
   host_count: number
+  /** DB-backed, so it is correct after a refresh and across restarts. */
+  active_execution_count: number
+  /**
+   * Declared by the backend schema but never populated by any route, so it is
+   * always null today. The UI must not present it as a real timestamp.
+   */
+  last_run_at: string | null
   created_at: string
   updated_at: string
 }
@@ -408,6 +452,8 @@ export interface WorkflowCreate {
   entries: WorkflowEntryInput[]
   variables: WorkflowVariable[]
   hosts: WorkflowHost[]
+  visibility?: WorkflowVisibility
+  execution_permission?: ExecutionPermission
 }
 export interface WorkflowUpdate extends WorkflowCreate {
   /** Optimistic concurrency: the row_version the editor loaded. */
@@ -493,7 +539,26 @@ export interface ExecutionListResponse {
 export interface ExecutionDetail extends ExecutionSummary {
   log_path: string | null
   error_message: string | null
+  /** Read-only today: no route accepts a log-visibility change. */
+  log_visibility: LogVisibility
+  /**
+   * Set while a cancellation has been requested but the run has not settled.
+   * A run can be `running` with this set, which is what the UI shows as
+   * "cancelling" rather than "cancelled".
+   */
+  cancel_requested_at: string | null
+  cancel_requested_by_id: number | null
+  cancel_reason: string | null
+  /** True while a worker in some process still holds this run. */
+  is_active: boolean
   hosts: HostRun[]
+}
+
+/** Mirrors `CancelResponse`: idempotent, and says whether it recorded a request. */
+export interface CancelResponse {
+  id: number
+  status: ExecutionStatus
+  cancel_requested: boolean
 }
 
 /** One host run's filesystem transcript. `content` is empty when unavailable. */

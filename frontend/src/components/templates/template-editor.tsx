@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/dialog'
 import { isLockLost, isStaleUpdate, useEditorLock } from '@/hooks/use-templates'
 import type {
+  RunAsMethod,
   StepRule,
   StepRuleInput,
   TemplateDetail,
@@ -34,7 +35,9 @@ import type {
 import { cn } from '@/lib/utils'
 import { RuleEditor, validateRule } from './rule-editor'
 
-/** A step in the form. `key` is local-only so React keeps identity across moves. */
+/**
+ * A step in the form. `key` is local-only so React keeps identity across moves.
+ */
 interface DraftStep {
   key: string
   name: string
@@ -44,6 +47,13 @@ interface DraftStep {
   timeout_seconds: number
   /** Kept so a save never silently drops a rule the API would otherwise keep. */
   rule: StepRule
+  /**
+   * Per-step Run-As. Empty means "run as the SSH login user", which is what the
+   * backend stores as `null`; there is no way to name a target and then forget
+   * the method, because the form always supplies a default.
+   */
+  run_as_username: string
+  run_as_method: RunAsMethod
 }
 
 export interface TemplateDraft {
@@ -56,10 +66,19 @@ export interface TemplateDraft {
     interpreter: string
     timeout_seconds: number
     rule: StepRuleInput
+    run_as_username: string | null
+    run_as_method: RunAsMethod | null
   }>
 }
 
 const INTERPRETERS = ['bash', 'sh', 'python3', 'python', 'perl', 'ruby', 'node'] as const
+
+/**
+ * Mirrors `run_as.USERNAME_PATTERN`, including its negative lookbehind: the
+ * backend rejects a trailing hyphen, so accepting one here would produce a save
+ * the API refuses.
+ */
+const RUN_AS_TARGET = /^[a-z_][a-z0-9_-]{0,31}$/
 
 let nextKey = 0
 function freshKey(): string {
@@ -78,6 +97,8 @@ function toDrafts(steps: TemplateStep[]): DraftStep[] {
     interpreter: step.interpreter,
     timeout_seconds: step.timeout_seconds,
     rule: step.rule ?? CONTINUE_RULE,
+    run_as_username: step.run_as_username ?? '',
+    run_as_method: step.run_as_method ?? 'nopasswd',
   }))
 }
 
@@ -91,6 +112,8 @@ function emptyStep(): DraftStep {
     interpreter: 'bash',
     timeout_seconds: 300,
     rule: CONTINUE_RULE,
+    run_as_username: '',
+    run_as_method: 'nopasswd',
   }
 }
 
@@ -127,14 +150,21 @@ export function draftToPayload(
   return {
     name: name.trim(),
     description: description.trim() ? description.trim() : null,
-    steps: steps.map((step) => ({
-      name: step.name.trim(),
-      description: step.description.trim() ? step.description.trim() : null,
-      script: step.script,
-      interpreter: step.interpreter.trim(),
-      timeout_seconds: Number(step.timeout_seconds) || 0,
-      rule: ruleToPayload(step.rule),
-    })),
+    steps: steps.map((step) => {
+      const target = step.run_as_username.trim()
+      return {
+        name: step.name.trim(),
+        description: step.description.trim() ? step.description.trim() : null,
+        script: step.script,
+        interpreter: step.interpreter.trim(),
+        timeout_seconds: Number(step.timeout_seconds) || 0,
+        rule: ruleToPayload(step.rule),
+        // Both fields travel together or neither does: a target with no method
+        // would be rejected, and a method with no target is meaningless.
+        run_as_username: target ? target : null,
+        run_as_method: target ? step.run_as_method : null,
+      }
+    }),
   }
 }
 
@@ -203,6 +233,15 @@ export function TemplateEditor({
       if (!step.script.trim()) return `Step ${index + 1} needs a script.`
       if (!Number.isFinite(step.timeout_seconds) || step.timeout_seconds < 1) {
         return `Step ${index + 1} needs a timeout of at least 1 second.`
+      }
+      // Mirrors `run_as.validate_target` so an unusable target is caught here
+      // instead of failing the run after the host was already contacted.
+      const target = step.run_as_username.trim()
+      if (target && (!RUN_AS_TARGET.test(target) || target.endsWith('-'))) {
+        return `Step ${index + 1}: "${target}" is not a valid Run-As username. Use lowercase letters, digits, "_" or "-", starting with a letter or underscore and not ending with "-".`
+      }
+      if (target === 'root') {
+        return `Step ${index + 1}: Run-As cannot target root. Use an unprivileged account with only the sudoers rules it needs.`
       }
       // A partial rule would be rejected by the API; catch it here with a
       // message that names the step instead of surfacing a raw 422.
@@ -428,6 +467,58 @@ export function TemplateEditor({
                     />
                   </label>
                 </div>
+
+                {/*
+                  Per-step Run-As, distinct from a workflow Run-As block: this one
+                  belongs to the template, so it travels with every workflow that
+                  uses it. Empty means "run as the SSH login user", which is why
+                  the method selector is hidden until a target is named.
+                */}
+                <div className="mt-2 rounded-md border border-dashed p-2">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1 text-xs">
+                      <span className="text-muted-foreground">
+                        Run as user (optional)
+                      </span>
+                      <input
+                        className={cn(inputClass, 'font-mono')}
+                        value={step.run_as_username}
+                        maxLength={32}
+                        spellCheck={false}
+                        onChange={(event) =>
+                          update(index, { run_as_username: event.target.value })
+                        }
+                        placeholder="Leave empty to use the SSH login user"
+                        aria-label={`Step ${index + 1} run as user`}
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs">
+                      <span className="text-muted-foreground">Elevation method</span>
+                      <select
+                        className={inputClass}
+                        value={step.run_as_method}
+                        disabled={!step.run_as_username.trim()}
+                        onChange={(event) =>
+                          update(index, {
+                            run_as_method: event.target.value as RunAsMethod,
+                          })
+                        }
+                        aria-label={`Step ${index + 1} run as method`}
+                      >
+                        <option value="nopasswd">Passwordless sudo</option>
+                        <option value="password">Sudo password</option>
+                      </select>
+                    </label>
+                  </div>
+                  <p className="text-muted-foreground mt-1 text-xs">
+                    {!step.run_as_username.trim()
+                      ? 'The step runs as the account in the SSH credential.'
+                      : step.run_as_method === 'password'
+                        ? 'Uses the sudo password stored on the workflow credential. It is never written to the transcript.'
+                        : 'Requires a sudoers rule for this target; no password is sent.'}
+                  </p>
+                </div>
+
                 <RuleEditor
                   rule={step.rule}
                   stepNumber={index + 1}

@@ -95,9 +95,19 @@ export function DashboardPage() {
               />
               <Stat
                 label="Scheduler"
-                value={data.scheduler_enabled ? 'Enabled' : 'Not started'}
-                hint="APScheduler, next milestone"
-                tone="neutral"
+                value={
+                  data.scheduler.running
+                    ? 'Running'
+                    : data.scheduler_enabled
+                      ? 'Waiting for lease'
+                      : 'Disabled'
+                }
+                hint={
+                  data.scheduler.lease_held
+                    ? 'this process dispatches scheduled runs'
+                    : 'scheduled runs are not dispatched here'
+                }
+                tone={data.scheduler.lease_held ? 'ok' : 'neutral'}
               />
               <Stat
                 label="Environment"
@@ -158,8 +168,8 @@ export function DashboardPage() {
                 ))}
               </ul>
               <p className="text-muted-foreground mt-3 text-xs">
-                Scheduled runs (APScheduler) are not enabled yet. Everything else —
-                credentials, templates, workflows and run history — is usable now.
+                Schedules are created from a workflow. Whether this process dispatches
+                them is the scheduler status shown above.
               </p>
             </CardContent>
           </Card>

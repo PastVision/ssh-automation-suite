@@ -24,12 +24,19 @@ export interface HealthPaths {
   private_key_dir: string
 }
 
+export interface HealthScheduler {
+  running: boolean
+  lease_held: boolean
+  generation: number | null
+}
+
 export interface HealthResponse {
   status: HealthStatus
   app: string
   version: string
   environment: string
   scheduler_enabled: boolean
+  scheduler: HealthScheduler
   database: HealthDatabase
   concurrency: HealthConcurrency
   paths: HealthPaths

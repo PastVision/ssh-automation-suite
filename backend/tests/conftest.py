@@ -7,21 +7,89 @@ Test databases are produced by the real Alembic migrations, not by
 ``Base.metadata.create_all``. ``migrated_database`` builds one migrated file per
 session and each test receives a copy of it, so the suite exercises the schema a
 deployment actually gets while still paying for ``upgrade head`` only once.
+
+Isolation is enforced at *import* time, not just per test. Three things resolve
+settings before or outside any fixture: ``app.main`` builds a module-level
+``app = create_app()`` when it is imported, ``migrations/env.py`` calls
+``get_settings()`` every time Alembic runs, and a few modules read settings during
+collection. A per-test fixture cannot cover those, so the process environment is
+pointed at a throwaway session directory below -- before any ``app`` module is
+imported. Without this, a plain ``pytest`` run creates the developer's real
+``backend/data`` directory and may write a database into it.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app.core import security
-from app.core.config import Settings, get_settings
-from app.db import session as db_session
-from app.services import concurrency
+# --- Process-wide isolated runtime paths ---------------------------------- #
+# Must run before importing anything under ``app``. A session ``mkdtemp`` (not a
+# pytest fixture) is used precisely because fixture setup happens too late: the
+# first ``from app.main import ...`` already built an app from real settings.
+_SESSION_RUNTIME = Path(tempfile.mkdtemp(prefix="sshsuite-test-runtime-"))
+atexit.register(shutil.rmtree, _SESSION_RUNTIME, ignore_errors=True)
+
+# Force rather than default: a developer with SSHSUITE_DATA_DIR exported for a
+# real run must still get an isolated suite, and inheriting it silently would
+# point every test at their live database.
+os.environ["SSHSUITE_DATA_DIR"] = str(_SESSION_RUNTIME / "data")
+os.environ["SSHSUITE_LOG_DIR"] = str(_SESSION_RUNTIME / "logs")
+os.environ["SSHSUITE_SECRET_KEY_FILE"] = str(_SESSION_RUNTIME / "data" / "secret.key")
+os.environ["SSHSUITE_DATABASE_URL"] = ""
+os.environ["SSHSUITE_ENVIRONMENT"] = "test"
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.core import security  # noqa: E402
+from app.core.config import BACKEND_DIR, Settings, get_settings  # noqa: E402
+from app.db import session as db_session  # noqa: E402
+from app.services import concurrency  # noqa: E402
+
+
+# --- Real-runtime baseline ------------------------------------------------ #
+# Captured here, at conftest import, for two reasons. It precedes every test
+# module import (so also the first ``from app.main import ...``, which builds an
+# app and calls ``ensure_directories``), and it uses the ``BACKEND_DIR`` constant
+# rather than ``get_settings()``, so neither a changed working directory nor a
+# cleared/repopulated settings cache can move what is being compared.
+def _snapshot_real_runtime() -> dict[str, tuple[str, int, int]]:
+    """Every entry under the real data/log dirs -> (kind, size, mtime_ns).
+
+    Directories are recorded as well as files. ``ensure_directories`` only ever
+    calls ``mkdir``, so a leak can create empty ``data/keys`` or ``logs/executions``
+    trees that hold no files; tracking files alone would miss exactly the shape of
+    the original bug.
+    """
+    snapshot: dict[str, tuple[str, int, int]] = {}
+    for root in (BACKEND_DIR / "data", BACKEND_DIR / "logs"):
+        if not root.exists():
+            continue
+        snapshot[str(root)] = ("dir", 0, root.stat().st_mtime_ns)
+        for path in sorted(root.rglob("*")):
+            stat = path.stat()
+            kind = "dir" if path.is_dir() else "file"
+            snapshot[str(path)] = (kind, stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+
+_REAL_RUNTIME_BASELINE = _snapshot_real_runtime()
+
+
+def _runtime_diff(
+    before: dict[str, tuple[str, int, int]], after: dict[str, tuple[str, int, int]]
+) -> tuple[list[str], list[str], list[str]]:
+    """Created, deleted and modified paths between two runtime snapshots."""
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    modified = sorted(name for name in set(before) & set(after) if before[name] != after[name])
+    return added, removed, modified
 
 
 @pytest.fixture()
@@ -155,6 +223,57 @@ def _no_real_home_config() -> Iterator[None]:
     finally:
         if previous is None:
             os.environ.pop("SSHSUITE_DATA_DIR", None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_caches_between_tests() -> Iterator[None]:
+    """Drop every cached settings/engine object after each test.
+
+    ``get_settings`` is ``lru_cache``-backed and several helpers (the lab helper,
+    the proxy-settings builders, the migration tooling) call ``cache_clear`` and
+    then repopulate it with their own values. Without a reset the *next* test
+    inherits those settings -- including its data directory -- which is how a test
+    can end up pointed at a database it never asked for. Resetting afterwards
+    makes each test start from the pinned, isolated environment.
+    """
+    yield
+    get_settings.cache_clear()
+    db_session.reset_engine()
+    security.reset_fernet_cache()
+    concurrency.reset_limiter()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_runtime_is_untouched() -> Iterator[None]:
+    """Fail the run if anything wrote to ``backend/data`` or ``backend/logs``.
+
+    The per-test ``settings`` fixture is not sufficient on its own: settings are
+    also resolved at import time (``app.main``) and by Alembic (``env.py``), which
+    is how a full run used to create the real data directory. The baseline was
+    taken when this module was imported, before any test module could import the
+    application, so even the very first ``ensure_directories`` call is covered.
+    """
+    yield
+
+    added, removed, modified = _runtime_diff(_REAL_RUNTIME_BASELINE, _snapshot_real_runtime())
+    if not (added or removed or modified):
+        return
+
+    detail = "\n".join(
+        part
+        for part in (
+            "\n".join(f"  created {name}" for name in added),
+            "\n".join(f"  deleted {name}" for name in removed),
+            "\n".join(f"  modified {name}" for name in modified),
+        )
+        if part
+    )
+    pytest.fail(
+        "The test run wrote to the real backend/data or backend/logs tree. Tests "
+        "must resolve paths to a temporary directory; see the import-time "
+        "bootstrap at the top of tests/conftest.py.\n" + detail,
+        pytrace=False,
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:

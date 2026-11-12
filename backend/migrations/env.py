@@ -28,8 +28,14 @@ if config.config_file_name is not None and config.attributes.get("configure_logg
     fileConfig(config.config_file_name)
 
 settings = get_settings()
-settings.ensure_directories()
 if not config.get_main_option("sqlalchemy.url"):
+    # Only the application's own default database lives under the app's data
+    # directory, so only that case needs the tree created. When the caller passes
+    # an explicit URL (the test suite, CI, or ``alembic -x``) the target is
+    # somewhere else entirely, and creating the app's ``data/`` and ``logs/``
+    # directories here would write into the developer's real state as a side
+    # effect of migrating an unrelated temporary database.
+    settings.ensure_directories()
     config.set_main_option("sqlalchemy.url", settings.resolved_database_url)
 
 target_metadata = Base.metadata

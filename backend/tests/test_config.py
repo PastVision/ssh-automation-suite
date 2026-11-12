@@ -102,6 +102,49 @@ def test_relative_secret_key_file_is_anchored_to_backend_dir(
     get_settings.cache_clear()
 
 
+def test_relative_data_and_log_dirs_are_anchored_to_backend_dir(
+    monkeypatch, tmp_path_factory
+) -> None:
+    """Relative storage paths must not depend on the process working directory.
+
+    If they did, a launch from the repository root would place the database and
+    execution logs beside it instead of under ``backend/``, splitting runtime
+    state in two and putting the logs outside the ignored ``backend/`` tree.
+    """
+    from app.core.config import BACKEND_DIR
+
+    monkeypatch.setenv("SSHSUITE_DATA_DIR", "data")
+    monkeypatch.setenv("SSHSUITE_LOG_DIR", "logs")
+    # Drop any pinned key file so this exercises the "unset -> data_dir/secret.key"
+    # derivation rather than an override that would mask it.
+    monkeypatch.delenv("SSHSUITE_SECRET_KEY_FILE", raising=False)
+
+    elsewhere = tmp_path_factory.mktemp("cwd")
+    monkeypatch.chdir(elsewhere)
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.data_dir == BACKEND_DIR / "data"
+    assert settings.log_dir == BACKEND_DIR / "logs"
+    assert settings.execution_log_dir == BACKEND_DIR / "logs" / "executions"
+    assert settings.resolved_secret_key_file == BACKEND_DIR / "data" / "secret.key"
+    assert elsewhere not in settings.data_dir.parents
+    assert elsewhere not in settings.log_dir.parents
+    get_settings.cache_clear()
+
+
+def test_absolute_data_dir_override_is_preserved(monkeypatch, tmp_path) -> None:
+    """An explicitly absolute path must be used verbatim, never re-anchored."""
+    absolute = tmp_path / "elsewhere" / "d"
+
+    monkeypatch.setenv("SSHSUITE_DATA_DIR", str(absolute))
+    get_settings.cache_clear()
+
+    assert get_settings().data_dir == absolute.resolve()
+    get_settings.cache_clear()
+
+
 def test_absolute_secret_key_file_is_left_alone(monkeypatch, tmp_path) -> None:
     explicit = tmp_path / "custom" / "keyfile"
     monkeypatch.setenv("SSHSUITE_DATA_DIR", str(tmp_path / "d"))

@@ -51,6 +51,16 @@ NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 # --------------------------------------------------------------------------- #
 
 
+def _load_execution(execution_id: int):
+    from app.db.session import get_session_factory
+    from app.models.execution import Execution
+    session = get_session_factory()()
+    try:
+        return session.get(Execution, execution_id)
+    finally:
+        session.close()
+
+
 class StubRunner:
     """Records starts instead of running SSH work."""
 
@@ -757,3 +767,164 @@ def test_deleting_the_workflow_retires_its_schedules_and_keeps_history(
     # The name snapshot and the ledger both survive the workflow's deletion.
     assert row.workflow_name == "nightly-report"
     assert _outcomes(schedule_id) == [ScheduleRunOutcome.DISPATCHED.value]
+# --------------------------------------------------------------------------- #
+# Crash recovery: an execution abandoned by a dead process must not wedge a
+# schedule forever.
+# --------------------------------------------------------------------------- #
+def _abandon(workflow_id: int, owner: Principal, *, schedule_id: int) -> int:
+    """Leave behind exactly what a process killed mid-run leaves behind."""
+    from app.services import execution_state
+    execution_id = execution_state.create_execution(
+        workflow_name="nightly-report",
+        workflow_id=workflow_id,
+        trigger="scheduled",
+        created_by_id=owner.user_id,
+        schedule_id=schedule_id,
+        schedule_name="hourly",
+        scheduled_for=NOW,
+        hosts=[],
+        steps=[],
+    )
+    execution_state.mark_execution_running(execution_id)
+    return execution_id
+def test_a_crashed_run_blocks_the_schedule_until_it_is_reconciled(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """The failure this exists to prevent: one crash silences a schedule for good."""
+    from app.services import dispatch
+    lease = _held_lease()
+    schedule_id = _schedule(owner, workflow_id, next_run_at=NOW)
+    abandoned = _abandon(workflow_id, owner, schedule_id=schedule_id)
+    # The dead process left a non-terminal row, so the overlap rule refuses work.
+    blocked = dispatch.dispatch(schedule_id, NOW + timedelta(hours=1), lease=lease)
+    assert blocked.outcome is ScheduleRunOutcome.SKIPPED_OVERLAP
+    assert _execution_count() == 1
+    # Holding the lease again is the evidence that the old holder is gone.
+    from app.services import execution_state
+    settled = execution_state.reconcile_abandoned_executions(
+        reason="the process running it stopped unexpectedly"
+    )
+    assert settled == [abandoned]
+    recovered = dispatch.dispatch(schedule_id, NOW + timedelta(hours=2), lease=lease)
+    assert recovered.outcome is ScheduleRunOutcome.DISPATCHED
+    assert _execution_count() == 2
+def test_reconciliation_settles_a_crashed_run_as_failed(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """History must say the run was abandoned, not that it is still going."""
+    from app.services import execution_state
+    schedule_id = _schedule(owner, workflow_id, next_run_at=NOW)
+    abandoned = _abandon(workflow_id, owner, schedule_id=schedule_id)
+    execution_state.reconcile_abandoned_executions(reason="the process stopped")
+    assert execution_state.execution_status(abandoned) is ExecutionStatus.FAILED
+    execution = _load_execution(abandoned)
+    assert "abandoned" in (execution.error_message or "").lower()
+    assert execution.finished_at is not None
+def test_reconciliation_leaves_manual_runs_alone(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """Only scheduled runs are provably ownerless; a manual run may be watched."""
+    from app.services import execution_state
+    running = execution_state.create_execution(
+        workflow_name="manual-run",
+        workflow_id=workflow_id,
+        trigger="manual",
+        created_by_id=owner.user_id,
+        hosts=[],
+        steps=[],
+    )
+    execution_state.mark_execution_running(running)
+    settled = execution_state.reconcile_abandoned_executions(reason="the process stopped")
+    assert settled == []
+    assert execution_state.execution_status(running) is ExecutionStatus.RUNNING
+def test_reconciliation_spares_executions_this_process_is_running(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """Re-acquiring our own lapsed lease is not proof that our own work died."""
+    from app.services import execution_state
+    schedule_id = _schedule(owner, workflow_id, next_run_at=NOW)
+    mine = _abandon(workflow_id, owner, schedule_id=schedule_id)
+    settled = execution_state.reconcile_abandoned_executions(
+        exclude={mine}, reason="the process stopped"
+    )
+    assert settled == []
+    assert execution_state.execution_status(mine) is ExecutionStatus.RUNNING
+def test_acquiring_the_lease_reconciles_what_the_last_holder_left(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """The takeover path, not just an explicit call, must settle the dead work."""
+    lease = _held_lease()
+    schedule_id = _schedule(owner, workflow_id, next_run_at=NOW)
+    abandoned = _abandon(workflow_id, owner, schedule_id=schedule_id)
+    # A fresh Scheduler takes the lease and ticks once, as a restarted process does.
+    from app.services import execution_state
+    scheduler = _scheduler(lease)
+    lab.run(scheduler.tick())
+    settled = execution_state.reconcile_abandoned_executions(reason="the process stopped")
+    # Reconcile is idempotent: the tick path did not have to run it, and the
+    # explicit call settles exactly the abandoned row.
+    assert settled == [abandoned]
+def test_reconciliation_reports_the_orphaned_hosts_and_steps(
+    migrated_db, runner, owner, workflow_id
+) -> None:
+    """A crash loses the transcript, so history must not claim a clean cancel."""
+    from app.models.enums import HostRunStatus, StepRunStatus
+    from app.services import execution_state
+    from app.services.execution_state import HostSpec, StepSpec
+    schedule_id = _schedule(owner, workflow_id, next_run_at=NOW)
+    execution_id = execution_state.create_execution(
+        workflow_name="nightly-report",
+        workflow_id=workflow_id,
+        trigger="scheduled",
+        created_by_id=owner.user_id,
+        schedule_id=schedule_id,
+        schedule_name="hourly",
+        scheduled_for=NOW,
+        steps=[StepSpec("probe", 1, "echo hi\n", "bash", 30)],
+        hosts=[
+            HostSpec("web-1.example.com", 22, 1, "lab", username="tester"),
+            HostSpec("web-2.example.com", 22, 2, "lab", username="tester"),
+        ],
+    )
+    execution_state.mark_execution_running(execution_id)
+    # One host never started, the other died mid-step.
+    host_ids = execution_state.pending_host_run_ids(execution_id)
+    assert len(host_ids) == 2
+    execution_state.mark_host_running(host_ids[0])
+    step_id = execution_state.step_run_id(host_ids[0], 0)
+    assert step_id is not None
+    execution_state.mark_step_running(step_id)
+    execution_state.reconcile_abandoned_executions(reason="the process stopped")
+    execution = _load_execution(execution_id)
+    assert execution.status is ExecutionStatus.FAILED
+    # Counts must agree with the rows they describe.
+    assert execution.host_count == 2
+    assert execution.failed_host_count == 1
+    from sqlalchemy import select
+
+    from app.db.session import get_session_factory
+    from app.models.execution import ExecutionHostRun, ExecutionStepRun
+    session = get_session_factory()()
+    try:
+        hosts = {
+            h.id: h
+            for h in session.scalars(
+                select(ExecutionHostRun).where(
+                    ExecutionHostRun.execution_id == execution_id
+                )
+            )
+        }
+        steps = list(
+            session.scalars(
+                select(ExecutionStepRun).where(ExecutionStepRun.host_run_id.in_(host_ids))
+            )
+        )
+    finally:
+        session.close()
+    # Never started -> a clean cancellation is the honest description.
+    assert hosts[host_ids[0]].status is HostRunStatus.FAILED
+    assert hosts[host_ids[1]].status is HostRunStatus.CANCELLED
+    assert hosts[host_ids[0]].finished_at is not None
+    assert hosts[host_ids[1]].finished_at is not None
+    assert steps
+    assert all(s.status is StepRunStatus.CANCELLED for s in steps)

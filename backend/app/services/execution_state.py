@@ -638,6 +638,22 @@ def finish_host(
                 step_run.finished_at = utcnow()
 
 
+def _apply_host_counters(execution: Execution, hosts: list[ExecutionHostRun]) -> None:
+    """Derive the execution's host tallies from its host rows.
+
+    Shared with reconciliation so a settled execution and a normally finished one
+    cannot disagree about the same set of host outcomes.
+    """
+    execution.host_count = len(hosts)
+    # TERMINATED is a *successful* early stop, so it counts with the succeeded
+    # hosts. It keeps its own status so the history can still say why the
+    # workflow ended before its last step.
+    execution.succeeded_host_count = sum(
+        1 for h in hosts if h.status in (HostRunStatus.SUCCEEDED, HostRunStatus.TERMINATED)
+    )
+    execution.failed_host_count = sum(1 for h in hosts if h.status is HostRunStatus.FAILED)
+
+
 def finish_execution(execution_id: int, *, status: ExecutionStatus,
                      error_message: str | None = None) -> None:
     """Persist the final state and the derived host counters.
@@ -652,18 +668,7 @@ def finish_execution(execution_id: int, *, status: ExecutionStatus,
         hosts = session.scalars(
             select(ExecutionHostRun).where(ExecutionHostRun.execution_id == execution_id)
         ).all()
-        execution.host_count = len(hosts)
-        # TERMINATED is a *successful* early stop, so it counts with the
-        # succeeded hosts. It keeps its own status so the history can still say
-        # why the workflow ended before its last step.
-        execution.succeeded_host_count = sum(
-            1
-            for h in hosts
-            if h.status in (HostRunStatus.SUCCEEDED, HostRunStatus.TERMINATED)
-        )
-        execution.failed_host_count = sum(
-            1 for h in hosts if h.status is HostRunStatus.FAILED
-        )
+        _apply_host_counters(execution, list(hosts))
         execution.status = status
         execution.error_message = error_message
         execution.finished_at = utcnow()
@@ -873,3 +878,68 @@ def latest_execution_started_at() -> datetime | None:
         return session.scalar(select(Execution.started_at).order_by(Execution.id.desc()))
     finally:
         session.close()
+
+
+def reconcile_abandoned_executions(
+    *, exclude: set[int] | None = None, reason: str
+) -> list[int]:
+    """Settle scheduled executions that no live process can still be running.
+
+    A process killed between dispatch and completion leaves its execution row at
+    PENDING or RUNNING forever. Because the overlap rule is a partial unique index
+    on non-terminal rows, such a row does not just look wrong in history -- it
+    blocks every later firing of that schedule permanently.
+
+    Only executions with a ``schedule_id`` are settled. A scheduled row can only
+    have been inserted by a scheduler lease holder (dispatch fences on the lease),
+    so a caller that holds the lease now is entitled to conclude that any
+    non-terminal scheduled row belongs to a holder that is gone. Manual runs are
+    deliberately left alone: their owner may still be watching, and cancelling
+    someone else's run on a guess is worse than leaving a row open.
+
+    ``exclude`` lets the caller protect executions *this* process is running, which
+    matters if it re-acquires a lease it previously let lapse.
+    """
+    excluded = exclude or set()
+    settled: list[int] = []
+    with _write_session() as session:
+        rows = session.scalars(
+            select(Execution).where(
+                Execution.schedule_id.is_not(None),
+                Execution.status.in_([ExecutionStatus.PENDING, ExecutionStatus.RUNNING]),
+            )
+        ).all()
+        now = utcnow()
+        for execution in rows:
+            if execution.id in excluded:
+                continue
+            hosts = session.scalars(
+                select(ExecutionHostRun).where(
+                    ExecutionHostRun.execution_id == execution.id
+                )
+            ).all()
+            for host in hosts:
+                if host.status is HostRunStatus.PENDING:
+                    # Never started: it skipped cleanly, so CANCELLED is accurate.
+                    host.status = HostRunStatus.CANCELLED
+                elif host.status is HostRunStatus.RUNNING:
+                    # Interrupted mid-flight: its transcript is incomplete, which
+                    # the history must not report as a clean cancellation.
+                    host.status = HostRunStatus.FAILED
+                    host.error_message = f"Execution abandoned ({reason})."
+                else:
+                    continue
+                host.finished_at = now
+                for step_run in host.step_runs:
+                    if step_run.status in (StepRunStatus.PENDING, StepRunStatus.RUNNING):
+                        step_run.status = StepRunStatus.CANCELLED
+                        step_run.finished_at = now
+            execution.status = ExecutionStatus.FAILED
+            execution.error_message = f"Execution abandoned ({reason})."
+            execution.finished_at = now
+            # Host statuses changed, so the derived counters must follow: leaving
+            # them stale would report a finished execution whose failed count
+            # contradicts its own host rows.
+            _apply_host_counters(execution, hosts)
+            settled.append(execution.id)
+    return settled

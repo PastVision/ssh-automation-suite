@@ -119,12 +119,16 @@ class Scheduler:
             logger.info("Scheduler idle: %s", state.description)
         else:
             logger.info("Scheduler acquired the lease (generation %s)", state.generation)
+            self._reconcile_abandoned()
 
         try:
             while not self._stopping.is_set():
                 if not self.lease.held:
                     if self.lease.acquire(now=self._now()).held:
                         logger.info("Scheduler acquired a vacant lease")
+                        # The previous holder died without settling its work; the
+                        # lease changing hands is exactly the evidence needed.
+                        self._reconcile_abandoned()
                 if self.lease.held:
                     await self.tick()
                 await self._sleep(self.settings.scheduler_poll_seconds)
@@ -133,6 +137,39 @@ class Scheduler:
         finally:
             with contextlib.suppress(Exception):
                 self.lease.release(now=self._now())
+
+    def _reconcile_abandoned(self) -> None:
+        """Settle scheduled executions left non-terminal by a dead holder.
+
+        Without this, the overlap index turns one crash into a schedule that never
+        fires again: the abandoned row keeps its PENDING/RUNNING status forever and
+        every later firing is refused as an overlap. Runs this process is executing
+        are excluded, because re-acquiring our own lapsed lease is not evidence
+        that our work died.
+        """
+        from app.services import execution_runner, execution_state
+
+        in_flight: set[int] = set()
+        if execution_runner.RUNNER_SINGLETON is not None:
+            # Defensive: a test double or an alternative runner need not implement
+            # the introspection method, and recovery must still run without it.
+            active = getattr(execution_runner.get_runner(), "active_execution_ids", None)
+            if callable(active):
+                in_flight = set(active())
+        try:
+            settled = execution_state.reconcile_abandoned_executions(
+                exclude=in_flight,
+                reason="the process running it stopped unexpectedly",
+            )
+        except Exception:  # noqa: BLE001 - never let recovery stop scheduling
+            logger.exception("Could not reconcile abandoned executions")
+            return
+        if settled:
+            logger.warning(
+                "Settled %d abandoned scheduled execution(s): %s",
+                len(settled),
+                settled,
+            )
 
     def request_stop(self) -> None:
         self._stopping.set()

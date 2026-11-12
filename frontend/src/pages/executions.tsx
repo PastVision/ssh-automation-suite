@@ -9,7 +9,7 @@
  * Workflows page becomes visible here without a manual refresh.
  */
 
-import { ListChecks, RefreshCw } from 'lucide-react'
+import { CalendarClock, ListChecks, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 
 import { StatusBadge } from '@/components/executions/status-badge'
@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useExecution, useExecutions } from '@/hooks/use-executions'
+import { formatApiInstant, parseApiInstant } from '@/lib/display'
 import type { ExecutionStatus, HostRun } from '@/lib/types'
 
 const FILTERS: Array<ExecutionStatus | 'all'> = [
@@ -37,14 +38,14 @@ const FILTERS: Array<ExecutionStatus | 'all'> = [
 ]
 
 function formatDate(value: string | null): string {
-  if (!value) return '—'
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+  return formatApiInstant(value)
 }
 
 function formatDuration(start: string | null, end: string | null): string {
-  if (!start || !end) return '—'
-  const ms = new Date(end).getTime() - new Date(start).getTime()
+  const from = parseApiInstant(start)
+  const to = parseApiInstant(end)
+  if (!from || !to) return '—'
+  const ms = to.getTime() - from.getTime()
   if (!Number.isFinite(ms) || ms < 0) return '—'
   if (ms < 1000) return `${ms} ms`
   const seconds = ms / 1000
@@ -215,7 +216,14 @@ export function ExecutionsPage() {
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="font-medium">{execution.workflow_name}</span>
                     <StatusBadge status={execution.status} />
-                    <Badge variant="outline">{execution.trigger}</Badge>
+                    {execution.trigger === 'scheduled' ? (
+                      <Badge variant="secondary" className="gap-1">
+                        <CalendarClock aria-hidden="true" />
+                        {execution.schedule_name ?? 'scheduled'}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">manual</Badge>
+                    )}
                   </span>
                   <span className="text-muted-foreground flex flex-wrap items-center gap-3 text-xs">
                     <span>

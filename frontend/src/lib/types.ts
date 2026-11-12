@@ -427,6 +427,8 @@ export type ExecutionStatus =
   | 'succeeded'
   | 'failed'
   | 'cancelled'
+/** Mirrors `ExecutionTrigger`: whether a person or a schedule started the run. */
+export type ExecutionTrigger = 'manual' | 'scheduled'
 export type HostRunStatus =
   | 'pending'
   | 'running'
@@ -468,7 +470,15 @@ export interface ExecutionSummary {
   workflow_id: number | null
   workflow_name: string
   status: ExecutionStatus
-  trigger: string
+  trigger: ExecutionTrigger
+  /** Present only on scheduled runs; `null` for manual ones. */
+  schedule_id: number | null
+  schedule_name: string | null
+  /**
+   * The logical firing this run answers, in UTC. Distinct from `started_at`,
+   * which is when a worker actually picked it up.
+   */
+  scheduled_for: string | null
   host_count: number
   succeeded_host_count: number
   failed_host_count: number
@@ -494,4 +504,76 @@ export interface HostTranscript {
   available: boolean
   truncated: boolean
   content: string
+}
+
+/* -------------------------------------------------------------------------- */
+/* Schedules                                                                   */
+/* -------------------------------------------------------------------------- */
+/**
+ * Mirrors `ScheduleKind`. Every kind except `once` is stored as a cron
+ * expression: the backend has one timing engine, so `daily`/`weekly`/`monthly`
+ * are conveniences the form turns into cron rather than separate server types.
+ */
+export type ScheduleKind = 'once' | 'daily' | 'weekly' | 'monthly' | 'cron'
+/** Mirrors `MisfirePolicy`: what to do with a firing missed while down. */
+export type MisfirePolicy = 'skip' | 'run_once'
+/** Mirrors `ScheduleState`; `paused`/`disabled` differ in who paused it. */
+export type ScheduleState =
+  | 'scheduled'
+  | 'active'
+  | 'paused'
+  | 'disabled'
+  | 'completed'
+  | 'failed'
+  | 'missed'
+/** Mirrors `PausedReason`: why the scheduler parked a schedule on its own. */
+export type PausedReason = 'owner_inactive' | 'invalid_workflow' | 'unauthorized'
+
+export interface Schedule {
+  id: number
+  owner_id: number
+  workflow_id: number | null
+  workflow_name: string
+  name: string
+  schedule_kind: ScheduleKind
+  timezone: string
+  cron_expression: string | null
+  run_at: string | null
+  state: ScheduleState
+  enabled: boolean
+  paused_reason: PausedReason | null
+  misfire_policy: MisfirePolicy
+  misfire_grace_seconds: number
+  last_fired_for: string | null
+  next_run_at: string | null
+  row_version: number
+  created_at: string
+  updated_at: string
+}
+export interface ScheduleListResponse {
+  items: Schedule[]
+  total: number
+}
+/** The writable subset. `row_version` is added by the update call only. */
+export interface ScheduleInput {
+  name: string
+  workflow_id: number
+  schedule_kind: ScheduleKind
+  timezone: string
+  cron_expression?: string | null
+  run_at?: string | null
+  misfire_policy: MisfirePolicy
+  misfire_grace_seconds: number
+}
+export interface ScheduleUpdate extends ScheduleInput {
+  /** Optimistic concurrency: the revision the editor loaded. */
+  row_version: number
+}
+/** One previewed firing. `scheduled_for` is the authoritative UTC instant. */
+export interface PreviewFiring {
+  scheduled_for: string
+  local_time: string
+}
+export interface SchedulePreviewResponse {
+  items: PreviewFiring[]
 }

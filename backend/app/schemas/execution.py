@@ -80,6 +80,9 @@ class ExecutionRead(BaseModel):
     workflow_name: str
     status: ExecutionStatus
     trigger: str
+    schedule_id: int | None = None
+    schedule_name: str | None = None
+    scheduled_for: datetime | None = None
     host_count: int
     succeeded_host_count: int
     failed_host_count: int
@@ -108,6 +111,9 @@ class ExecutionSummary(BaseModel):
     workflow_name: str
     status: ExecutionStatus
     trigger: str
+    schedule_id: int | None = None
+    schedule_name: str | None = None
+    scheduled_for: datetime | None = None
     host_count: int
     succeeded_host_count: int
     failed_host_count: int

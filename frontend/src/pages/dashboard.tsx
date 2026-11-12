@@ -1,8 +1,10 @@
-import { AlertTriangle, CheckCircle2, RefreshCw, XCircle } from 'lucide-react'
+import { AlertTriangle, CalendarClock, CheckCircle2, RefreshCw, XCircle } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
 import { useHealth } from '@/hooks/use-health'
+import { useSchedules } from '@/hooks/use-schedules'
 import { ApiError } from '@/lib/api-client'
+import { formatApiInstant, parseApiInstant } from '@/lib/display'
 import { NAV_ITEMS } from '@/components/layout/nav-items'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -143,8 +145,7 @@ export function DashboardPage() {
             <CardHeader>
               <CardTitle className="text-base">Areas</CardTitle>
               <CardDescription>
-                What each area does today. Scheduling is the only part still
-                outstanding.
+                What each area does today.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -168,15 +169,94 @@ export function DashboardPage() {
                 ))}
               </ul>
               <p className="text-muted-foreground mt-3 text-xs">
-                Schedules are managed through the API; there is no scheduling screen
-                in this interface yet. Whether this process dispatches them is the
-                status shown above.
+                Schedules are created per workflow from the Workflows page.
+                Whether this process dispatches them is the status shown above.
               </p>
             </CardContent>
           </Card>
         </div>
       )}
+
+      <UpcomingRuns />
     </div>
+  )
+}
+
+/**
+ * The next scheduled runs across every visible workflow.
+ *
+ * Sorted and filtered in the browser because `GET /schedules` returns the
+ * caller's schedules unordered by time and carries no "upcoming" query. The set
+ * is small (one row per schedule), so paging it server-side would be premature.
+ */
+function UpcomingRuns() {
+  const schedules = useSchedules()
+
+  const upcoming = (schedules.data?.items ?? [])
+    .filter((schedule) => schedule.enabled && schedule.next_run_at !== null)
+    .sort(
+      (a, b) =>
+        (parseApiInstant(a.next_run_at)?.getTime() ?? 0) -
+        (parseApiInstant(b.next_run_at)?.getTime() ?? 0),
+    )
+    .slice(0, 5)
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <CalendarClock className="size-4" aria-hidden="true" />
+          Upcoming runs
+        </CardTitle>
+        <CardDescription>
+          The next firings across your scheduled workflows.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {schedules.isPending ? (
+          <div className="space-y-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : schedules.isError ? (
+          <p className="text-destructive text-sm">
+            Could not load schedules.
+          </p>
+        ) : upcoming.length === 0 ? (
+          <div className="rounded-lg border border-dashed p-4">
+            <p className="text-sm font-medium">Nothing scheduled</p>
+            <p className="text-muted-foreground mt-1 text-xs">
+              Open a workflow and choose <span className="font-medium">Schedules</span>{' '}
+              to run it on a timetable.
+            </p>
+            <Button asChild variant="outline" size="sm" className="mt-3">
+              <Link to="/workflows">Go to workflows</Link>
+            </Button>
+          </div>
+        ) : (
+          <ul className="divide-y">
+            {upcoming.map((schedule) => (
+              <li
+                key={schedule.id}
+                className="flex flex-wrap items-center justify-between gap-2 py-2.5"
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">
+                    {schedule.name}
+                  </span>
+                  <span className="text-muted-foreground block truncate text-xs">
+                    {schedule.workflow_name}
+                  </span>
+                </span>
+                <span className="text-muted-foreground shrink-0 text-xs">
+                  {formatApiInstant(schedule.next_run_at, schedule.timezone)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

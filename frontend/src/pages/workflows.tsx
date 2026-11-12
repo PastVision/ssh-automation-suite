@@ -9,9 +9,10 @@
  * longer matches the backend.
  */
 
-import { GitBranch, Pencil, Play, Plus, RefreshCw, Search, Trash2, Users } from 'lucide-react'
+import { CalendarClock, GitBranch, Pencil, Play, Plus, RefreshCw, Search, Trash2, Users } from 'lucide-react'
 import { useState } from 'react'
 
+import { ScheduleManagerDialog } from '@/components/schedules/schedule-manager-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -33,6 +34,7 @@ export function WorkflowsPage() {
   const [editingId, setEditingId] = useState<number | 'new' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [runningId, setRunningId] = useState<number | null>(null)
+  const [schedulesFor, setSchedulesFor] = useState<WorkflowSummary | null>(null)
 
   const list = useWorkflows(search)
   const editing = useWorkflow(typeof editingId === 'number' ? editingId : null)
@@ -186,11 +188,21 @@ export function WorkflowsPage() {
               onEdit={() => setEditingId(workflow.id)}
               onDelete={() => void handleDelete(workflow)}
               onRun={() => void handleRun(workflow)}
+              onSchedules={() => setSchedulesFor(workflow)}
               running={run.isPending && run.variables?.id === workflow.id}
             />
           ))}
         </div>
       )}
+
+      <ScheduleManagerDialog
+        open={schedulesFor !== null}
+        onOpenChange={(open) => {
+          if (!open) setSchedulesFor(null)
+        }}
+        workflowId={schedulesFor?.id ?? 0}
+        workflowName={schedulesFor?.name ?? ''}
+      />
 
       <WorkflowEditor
         open={editingId !== null}
@@ -215,10 +227,18 @@ interface WorkflowCardProps {
   onEdit: () => void
   onDelete: () => void
   onRun: () => void
+  onSchedules: () => void
   running: boolean
 }
 
-function WorkflowCard({ workflow, onEdit, onDelete, onRun, running }: WorkflowCardProps) {
+function WorkflowCard({
+  workflow,
+  onEdit,
+  onDelete,
+  onRun,
+  onSchedules,
+  running,
+}: WorkflowCardProps) {
   return (
     <Card className="flex flex-col">
       <CardHeader className="pb-2">
@@ -264,6 +284,9 @@ function WorkflowCard({ workflow, onEdit, onDelete, onRun, running }: WorkflowCa
           </Button>
           <Button variant="outline" size="sm" onClick={onEdit}>
             <Pencil /> {workflow.can_edit ? 'Edit' : 'View'}
+          </Button>
+          <Button variant="outline" size="sm" onClick={onSchedules}>
+            <CalendarClock /> Schedules
           </Button>
           {workflow.is_owner && (
             <Button

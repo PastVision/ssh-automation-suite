@@ -123,6 +123,22 @@ export function jsonInit(value: unknown, method = 'POST'): RequestInit {
   return { method, body: JSON.stringify(value) }
 }
 
+/**
+ * Absolute WebSocket URL for a backend path.
+ *
+ * `WebSocket` cannot resolve a relative URL, so the origin has to be built here.
+ * It follows the same rule as `apiFetch`: relative to the current origin unless
+ * `VITE_API_BASE_URL` points somewhere else, in which case the scheme is swapped
+ * to `ws`/`wss`. Cookies travel with the upgrade automatically.
+ */
+export function wsUrl(path: string): string {
+  if (API_BASE_URL) {
+    return `${API_BASE_URL.replace(/^http/, 'ws')}${path}`
+  }
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${scheme}//${window.location.host}${path}`
+}
+
 function safeJsonParse(text: string): unknown {
   try {
     return JSON.parse(text)

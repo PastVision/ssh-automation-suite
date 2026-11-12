@@ -11,10 +11,23 @@ its output, or cancel it, would be both a data leak and a denial of service.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from sqlalchemy import select
+from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.db.session import get_session_factory
@@ -28,14 +41,20 @@ from app.schemas.execution import (
     ExecutionListResponse,
     ExecutionRead,
     ExecutionSummary,
-    HostTranscriptRead,
     HostRunRead,
+    HostTranscriptRead,
     StepRunRead,
 )
 from app.services import audit, execution_state, sessions
 from app.services.execution_state import HostSpec, StepSpec
+from app.services.identity import (
+    client_ip,
+    require_principal,
+    require_same_origin,
+    resolve_principal,
+)
+from app.services.log_broadcast import drain_dropped, get_broadcaster
 from app.services.log_store import get_log_store
-from app.services.identity import client_ip, require_principal
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +92,19 @@ def _credential_for_user(credential_id: int, user_id: int) -> tuple[str, str, in
 
 
 def _owned_execution(
-    execution_id: int, principal: sessions.Principal, *, action: str, request: Request
+    execution_id: int,
+    principal: sessions.Principal,
+    *,
+    action: str,
+    request: HTTPConnection,
 ):
     """Load an execution the caller created, or answer 404.
 
     404 rather than 403 on purpose: confirming that somebody else's execution id
     exists is itself a small information leak, and the UI has no use for it.
+
+    Typed on ``HTTPConnection`` so the transcript WebSocket shares this exact
+    check instead of re-deriving it; only ``.client`` is read, which both provide.
     """
     execution = execution_state.get_execution(execution_id)
     if execution is None or execution.created_by_id != principal.user_id:
@@ -386,3 +412,281 @@ def read_host_transcript(
         content=text,
     )
 
+
+# --------------------------------------------------------------------------- #
+# Live transcript streaming
+# --------------------------------------------------------------------------- #
+
+# Matches the HTTP transcript route's ceiling. The UI renders a tail, so this
+# bounds both the replay payload and what one client can pull into memory.
+_REPLAY_LIMIT_BYTES = 256_000
+
+# Idle re-check of the transcript file. Live output normally arrives through the
+# broadcaster; this covers bytes written before this process published them (an
+# app restart mid-run), so a tail cannot silently stop growing.
+_STREAM_POLL_SECONDS = 1.0
+
+# A host in any of these states will never write another byte, so a stream ends
+# after delivering what is on disk instead of holding the socket open forever.
+_TERMINAL_HOST_STATUSES = frozenset(
+    {"succeeded", "failed", "skipped", "cancelled", "terminated"}
+)
+
+
+async def _deny_websocket(websocket: WebSocket, status_code: int, detail: str) -> None:
+    """Refuse a WebSocket before acceptance, with a real HTTP status.
+
+    Denying is better than accepting and immediately closing: the client learns
+    why, and a policy failure cannot be mistaken for a stream that ended
+    normally.
+    """
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    with contextlib.suppress(RuntimeError):  # already responded or disconnected
+        await websocket.send_denial_response(response)
+
+
+async def _authorize_stream(
+    websocket: WebSocket, execution_id: int, host_run_id: int
+) -> tuple[str, str] | None:
+    """Authenticate and authorize a transcript stream, or deny and return None.
+
+    Origin is checked first. The HTTP CSRF middleware only wraps ``http``
+    requests, so a WebSocket upgrade never reaches it; without an explicit check
+    a hostile page could open a socket with the victim's cookie and read their
+    execution output.
+
+    Ownership and host membership reuse the HTTP rules, including 404 rather
+    than 403 so execution ids cannot be probed.
+    """
+    settings = websocket.app.state.settings
+
+    try:
+        require_same_origin(websocket, settings=settings)
+    except HTTPException as exc:
+        audit.record(
+            AuditAction.ACCESS_DENIED,
+            actor_id=None,
+            actor_username=None,
+            outcome=AuditOutcome.DENIED,
+            resource_type="execution",
+            resource_id=execution_id,
+            remote_addr=client_ip(websocket),
+            detail={"reason": "cross_origin_websocket", "attempted": "stream_transcript"},
+        )
+        await _deny_websocket(websocket, exc.status_code, str(exc.detail))
+        return None
+
+    try:
+        principal = resolve_principal(websocket)
+    except HTTPException as exc:
+        await _deny_websocket(websocket, exc.status_code, str(exc.detail))
+        return None
+
+    try:
+        execution = _owned_execution(
+            execution_id, principal, action="stream_transcript", request=websocket
+        )
+    except HTTPException as exc:
+        await _deny_websocket(websocket, exc.status_code, str(exc.detail))
+        return None
+
+    host = next((row for row in execution.host_runs if row.id == host_run_id), None)
+    if host is None:
+        audit.record(
+            AuditAction.ACCESS_DENIED,
+            actor_id=principal.user_id,
+            actor_username=principal.label,
+            session_id=principal.session_id,
+            outcome=AuditOutcome.DENIED,
+            resource_type="execution_host_run",
+            resource_id=host_run_id,
+            remote_addr=client_ip(websocket),
+            detail={"reason": "host_run_not_in_execution", "attempted": "stream_transcript"},
+        )
+        await _deny_websocket(websocket, status.HTTP_404_NOT_FOUND, "Host run not found")
+        return None
+
+    return host.hostname, str(host.status)
+
+
+def _tail_window(execution_id: int, host_run_id: int, hostname: str) -> tuple[bytes, int, bool]:
+    """Read the replayable tail of a transcript as ``(bytes, size, truncated)``.
+
+    Bytes rather than text: offsets are byte offsets, so a character-based
+    window would not line up with the boundary the client is deduplicating on.
+    """
+    path = get_log_store().host_log_path(execution_id, host_run_id, hostname)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return b"", 0, False
+    if size <= 0:
+        return b"", 0, False
+
+    truncated = size > _REPLAY_LIMIT_BYTES
+    offset = size - _REPLAY_LIMIT_BYTES if truncated else 0
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(size - offset), size, truncated
+
+
+def _trim_to_utf8_boundary(data: bytes, limit: int) -> tuple[bytes, int]:
+    """Cut ``data`` to ``limit`` bytes starting on a character boundary.
+
+    The window starts at an arbitrary byte offset, so its first byte may be the
+    middle of a multi-byte character. Decoding that would emit U+FFFD and
+    silently corrupt the transcript, so leading continuation bytes are skipped.
+    """
+    if len(data) <= limit:
+        return data, 0
+    start = len(data) - limit
+    while start < len(data) and (data[start] & 0xC0) == 0x80:
+        start += 1
+    return data[start:], start
+
+
+def _drop_leading_bytes(text: str, count: int) -> tuple[str, int]:
+    """Remove the first ``count`` bytes from ``text``.
+
+    Used to trim the part of a live frame the replay already delivered. Slicing
+    the *string* would be wrong: ``count`` is a byte offset and may land inside a
+    multi-byte character. Returns the remaining text and the number of bytes
+    actually removed.
+    """
+    if count <= 0:
+        return text, 0
+    encoded = text.encode("utf-8", "replace")
+    if count >= len(encoded):
+        return "", len(encoded)
+    removed = count
+    while removed < len(encoded) and (encoded[removed] & 0xC0) == 0x80:
+        removed += 1
+    return encoded[removed:].decode("utf-8", "replace"), removed
+
+
+async def _forward_live(
+    websocket: WebSocket,
+    subscription,
+    *,
+    execution_id: int,
+    host_run_id: int,
+    boundary: int,
+    hostname: str,
+    terminal: bool,
+) -> None:
+    """Forward frames past ``boundary`` until the socket closes or the host ends.
+
+    ``boundary`` is the file size already sent by the replay. Frames that end at
+    or before it were produced while the replay was being read and are dropped;
+    a frame straddling it is trimmed, so no byte is delivered twice.
+    """
+    sent = boundary
+    while True:
+        try:
+            frame = await asyncio.wait_for(
+                subscription.queue.get(), timeout=_STREAM_POLL_SECONDS
+            )
+        except TimeoutError:
+            frame = None
+
+        if frame is not None:
+            if frame.end <= sent:
+                # Produced during the replay read; already on the wire.
+                continue
+            text, start = frame.text, frame.start
+            if frame.start < sent:
+                # Trim only the overlapping head so no byte is sent twice.
+                text, removed = _drop_leading_bytes(text, sent - frame.start)
+                start = frame.start + removed
+                if not text:
+                    continue
+            await websocket.send_json(
+                {"type": "chunk", "content": text, "start": start, "end": frame.end}
+            )
+            sent = max(sent, frame.end)
+            continue
+
+        dropped_chunks, dropped_bytes = drain_dropped(subscription)
+        if dropped_chunks:
+            await websocket.send_json(
+                {
+                    "type": "truncated",
+                    "reason": "subscriber_overflow",
+                    "dropped_chunks": dropped_chunks,
+                    "dropped_bytes": dropped_bytes,
+                }
+            )
+
+        # Nothing live arrived within the poll interval. If the host is finished
+        # it will never write again, so deliver any tail still missing (bytes
+        # produced before this process published them, e.g. after a restart) and
+        # end the stream rather than holding the socket open.
+        if terminal:
+            size = _tail_window(execution_id, host_run_id, hostname)[1]
+            if size > sent:
+                await websocket.send_json(
+                    {
+                        "type": "truncated",
+                        "reason": "stream_ended",
+                        "missing_bytes": size - sent,
+                    }
+                )
+            await websocket.send_json({"type": "end"})
+            return
+
+
+@router.websocket("/{execution_id}/hosts/{host_run_id}/ws")
+async def stream_host_transcript(
+    websocket: WebSocket, execution_id: int, host_run_id: int
+) -> None:
+    """Follow one host run's transcript as it is written.
+
+    Every transcript byte -- stdout, stderr and engine notes -- passes through
+    ``HostTranscript._raw``, which publishes it here with absolute file offsets.
+    This connection replays what already exists, then forwards live frames,
+    deduplicated by those offsets so output produced during the replay is
+    delivered exactly once.
+
+    The order is what makes it race-free: subscribing after reading the file
+    would lose anything written in between. Subscribing first and replaying to a
+    captured boundary can only duplicate, which the offsets then remove.
+    """
+    authorization = await _authorize_stream(websocket, execution_id, host_run_id)
+    if authorization is None:
+        return
+    hostname, host_status = authorization
+
+    broadcaster = get_broadcaster()
+    subscription = broadcaster.subscribe(execution_id, host_run_id)
+    try:
+        await websocket.accept()
+
+        replay, file_size, truncated = _tail_window(execution_id, host_run_id, hostname)
+        replay, skipped = _trim_to_utf8_boundary(replay, _REPLAY_LIMIT_BYTES)
+        await websocket.send_json(
+            {
+                "type": "replay",
+                "content": replay.decode("utf-8", errors="replace"),
+                "start": file_size - len(replay),
+                "end": file_size,
+                "truncated": truncated or skipped > 0,
+            }
+        )
+
+        await _forward_live(
+            websocket,
+            subscription,
+            execution_id=execution_id,
+            host_run_id=host_run_id,
+            boundary=file_size,
+            hostname=hostname,
+            terminal=host_status in _TERMINAL_HOST_STATUSES,
+        )
+    except WebSocketDisconnect:
+        pass
+    except asyncio.CancelledError:
+        # Shutdown or client abort. Reraise to preserve cancellation semantics;
+        # the finally below still unsubscribes.
+        raise
+    finally:
+        broadcaster.unsubscribe(execution_id, host_run_id, subscription)

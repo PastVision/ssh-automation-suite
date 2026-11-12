@@ -3,8 +3,9 @@
  *
  * This is a light monitor, not a second history page: it polls the execution the
  * launch returned, shows per-host progress, and links out to the full Executions
- * page for transcripts. HTTP polling is used because the runner has no WebSocket
- * push yet; the interval stops as soon as the run reaches a terminal state.
+ * page for transcripts. Progress is still polled because the run's own state is
+ * not pushed; the per-host transcript it opens is live over a WebSocket. The
+ * interval stops as soon as the run reaches a terminal state.
  */
 
 import { ExternalLink, RefreshCw } from 'lucide-react'

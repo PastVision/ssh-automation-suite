@@ -127,6 +127,23 @@ npm run lint
     adding it here *and* covering the path in
     `tests/test_workflow_execution_integration.py`.
 
+15. **Live transcript fan-out is in-process, and offsets are the contract.**
+    `services/log_broadcast.py` holds subscribers in memory and `HostTranscript`
+    publishes each chunk with absolute byte offsets. Consequences:
+    - A client in another process cannot publish to the server's broadcaster, so
+      live delivery must be tested in-process (the ASGI tests) -- a separate
+      script against a running server can only exercise replay.
+    - Bytes written by a previous server process are on disk but were never
+      announced. Once the host is finished the endpoint compares the file size
+      with what it forwarded and sends a `truncated` frame (`reason:
+      stream_ended`, with `missing_bytes`) before `end`, rather than silently
+      skipping. While a host is still running there is no such notice, so a
+      restarted server cannot recover mid-run output -- only its tail at the end.
+    - Never deliver a chunk the client already has: overlapping replays are the
+      normal case after a reconnect, and offsets are how duplicates are removed.
+    If fan-out ever needs to cross processes, this is the seam to change -- not
+    the callers.
+
 ## Conventions
 
 - Python 3.13, SQLAlchemy 2 typed `Mapped[...]` style, `from __future__ import annotations`.

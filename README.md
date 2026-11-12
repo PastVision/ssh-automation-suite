@@ -4,12 +4,14 @@ Run reusable shell-script templates over SSH across many hosts, from a small
 self-hosted web UI. No Redis, no Celery, no Kubernetes — one FastAPI process, a
 SQLite file, and logs on disk.
 
-> **Status: Milestones 1-3, 5 and 6 complete; milestone 4 partial.**
+> **Status: Milestones 1-3 and 5-7 complete; milestone 4 nearly complete.**
 > Credentials, versioned templates, workflows, the SSH execution engine,
-> end-to-end workflow authoring in the browser and APScheduler-based scheduling
-> all work against the local Docker SSH lab. Scheduling has an API and no screen
-> yet. Still missing: WebSocket log streaming (the UI polls over HTTP). See
-> [Roadmap](#roadmap) for what each milestone covers.
+> end-to-end workflow authoring in the browser, APScheduler-based scheduling and
+> live transcript streaming all work against the local Docker SSH lab.
+> Scheduling has an API and no screen yet. Milestone 4 still lacks a live view of
+> *execution* progress -- per-host transcripts stream over a WebSocket, while the
+> run's own status is polled. See [Roadmap](#roadmap) for what each milestone
+> covers.
 
 ---
 
@@ -18,9 +20,8 @@ SQLite file, and logs on disk.
 | Layer     | Technology                                                                 |
 | --------- | -------------------------------------------------------------------------- |
 | Frontend  | React 19, TypeScript, Vite 8, Tailwind CSS 4, shadcn/ui, React Router, TanStack Query |
-| Backend   | Python 3.13, FastAPI, SQLAlchemy 2, Alembic, Pydantic v2                   |
+| Backend   | Python 3.13, FastAPI, SQLAlchemy 2, Alembic, Pydantic v2, WebSockets        |
 | Storage   | SQLite for metadata, filesystem for execution logs, Fernet for secrets     |
-| Planned   | AsyncSSH (SSH transport), APScheduler (scheduling), WebSockets (live logs)  |
 
 ---
 
@@ -204,7 +205,9 @@ setting cannot reach a real deployment.
   recorded history.
 - Transcripts stream to `logs/executions/<id>/<host_run>-<host>.log`. Remote stderr
   is wrapped in `----- stderr -----` blocks so the two streams stay individually
-  identifiable; remote stdout is verbatim. Nothing is buffered whole in memory.
+  identifiable; remote stdout is verbatim. Nothing is buffered whole in memory,
+  and every chunk is published with absolute byte offsets so an open transcript
+  can follow the file live.
 
 ---
 
@@ -346,6 +349,15 @@ application nor able to reach its database or encryption key. See
 | `POST` | `/api/executions`                 | Start an execution. Returns `202` with the new id.  |
 | `GET`  | `/api/executions/{id}`            | Execution detail: per-host and per-step status.     |
 | `POST` | `/api/executions/{id}/cancel`     | Request cooperative cancellation.                   |
+| `GET`  | `/api/executions/{id}/hosts/{host_run_id}/transcript` | The host's transcript tail, read from disk. |
+| `WS`   | `/api/executions/{id}/hosts/{host_run_id}/ws` | Follow one host run live: a replay of the tail, then each new chunk with absolute byte offsets, then `end` once the host is finished. |
+
+The WebSocket requires the session cookie and a same-origin `Origin`; a bad
+origin is refused with `403` before the socket is accepted, and an execution
+belonging to another user answers `404` (never `403`) so its existence is not
+disclosed. Frames are `replay`, `chunk`, `truncated` and `end`. Offsets are what
+make reconnects exactly-once: a client drops anything at or below the highest
+offset it already holds.
 
 Schedules are managed under their own surface. Creating one stores the definition
 and computes the first firing; **the scheduler loop does the dispatching**, so a
@@ -434,9 +446,10 @@ npm run lint
 
 The backend suite covers configuration, encryption/key storage, the log store,
 the concurrency limiter, the health endpoint, the schema (including running the
-real Alembic migration against an empty database), and the execution engine's
-state machine and security properties. Tests use a temporary data directory, so
-they never touch `backend/data/`.
+real Alembic migration against an empty database), the execution engine's
+state machine and security properties, and the transcript WebSocket (auth,
+origin checks, replay, live chunks, offsets, multibyte text, disconnects).
+Tests use a temporary data directory, so they never touch `backend/data/`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -v
@@ -469,7 +482,7 @@ isolation, the global concurrency ceiling, cancellation, and shutdown.
 | **1 (done)** | Foundation: structure, config, SQLite + migrations, health endpoint, dashboard shell |
 | **2 (done)** | SSH credentials, versioned templates, workflows, execution history, log store, SSH test lab |
 | **3 (done)** | SSH execution engine: 20-host concurrency, sequential steps, fail-fast per host, cancellation, shutdown |
-| 4 (partial) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming: **not implemented**, the UI polls over HTTP |
+| 4 (nearly done) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming for per-host transcripts: **done**, with replay, live chunks and reconnect-safe offsets. Not yet streamed: the execution's own progress, which the UI still polls |
 | **5 (done)** | APScheduler scheduling: one-time and recurring schedules, firing ledger, misfire policy, lease-based single dispatcher, bounded catch-up. Schedules API only; no scheduling UI yet |
 | **6 (done)** | End-to-end workflow authoring in the UI: editor, host list, variables, run monitor, execution detail |
 | **7 (done)** | Scheduled execution reliability: overlap control, orphaned-run reconciliation after a crash, scheduler status on the dashboard, lab coverage for a scheduled firing |

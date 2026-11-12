@@ -17,6 +17,7 @@ output streams to disk instead of accumulating in memory.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,6 +27,11 @@ from app.services.log_store import ExecutionLogStore
 STDERR_OPEN = "----- stderr -----"
 STDERR_CLOSE = "----- end stderr -----"
 TERMINATOR = "\n"
+
+# Receives (text, start, end) for every append, where start/end are absolute
+# byte offsets in the transcript file. Synchronous by contract: it is called from
+# the SSH output path, so it must never await or block.
+ChunkCallback = Callable[[str, int, int], None]
 
 
 class HostTranscript:
@@ -38,6 +44,7 @@ class HostTranscript:
         host_run_id: int,
         hostname: str,
         settings: Settings | None = None,
+        on_chunk: ChunkCallback | None = None,
     ) -> None:
         self.execution_id = execution_id
         self.host_run_id = host_run_id
@@ -48,6 +55,8 @@ class HostTranscript:
         self._handle = None
         self._in_stderr = False
         self._at_line_start = True
+        self._on_chunk = on_chunk
+        self._offset = 0
 
     @property
     def path(self) -> Path:
@@ -62,6 +71,13 @@ class HostTranscript:
         # newline="" writes exactly the bytes received. Translation would rewrite
         # CRLF output coming from the remote and alter the transcript.
         self._handle = self._path.open("a", encoding="utf-8", errors="replace", newline="")
+        # Byte offset of the next append. Read after opening in append mode so a
+        # writer that resumes an existing transcript continues from its real end
+        # instead of restarting at 0 and confusing a reconnecting client.
+        try:
+            self._offset = self._path.stat().st_size
+        except OSError:  # pragma: no cover - file was just created
+            self._offset = 0
         stamp = datetime.now(UTC).isoformat(timespec="seconds")
         self._raw(
             f"===== host {self.hostname} (host_run {self.host_run_id}) started {stamp} =====\n"
@@ -87,6 +103,23 @@ class HostTranscript:
             return
         self._handle.write(text)
         self._at_line_start = text.endswith(TERMINATOR)
+        # Measure what was actually appended. The handle uses errors="replace",
+        # so an unencodable character becomes U+FFFD and grows: len(text) would
+        # understate the file and desynchronise every later offset.
+        byte_length = len(text.encode("utf-8", "replace"))
+        start, self._offset = self._offset, self._offset + byte_length
+        if self._on_chunk is not None:
+            # Flush first so the file is never behind the offsets we publish. The
+            # replay boundary is the file size; if buffered bytes were still in
+            # this handle, a client that subscribed just before the boundary
+            # would miss them -- they are neither on disk to replay nor in a
+            # queue it was yet listening to. Text-mode writes are buffered, so
+            # without this the file can legitimately lag by a whole buffer.
+            self._handle.flush()
+            # Synchronous and observational by contract. A subscriber that stops
+            # reading must never slow the SSH path down, so the callback only
+            # hands the frame to a bounded queue -- see log_broadcast.
+            self._on_chunk(text, start, self._offset)
 
     def _start_line_if_needed(self) -> None:
         if not self._at_line_start:

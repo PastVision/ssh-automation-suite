@@ -26,6 +26,7 @@ import logging
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, status
+from starlette.requests import HTTPConnection
 
 from app.core.config import Settings
 from app.models.audit_actions import AuditAction, AuditOutcome
@@ -49,13 +50,16 @@ def get_request_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def client_ip(request: Request) -> str | None:
+def client_ip(connection: HTTPConnection) -> str | None:
     """The immediate peer address.
 
     ``X-Forwarded-For`` is intentionally **not** used: it is client-controlled and
     would let anyone claim to come from a trusted proxy network.
+
+    Takes an ``HTTPConnection`` so a WebSocket upgrade can be audited the same way
+    an HTTP request is; ``Request`` and ``WebSocket`` both satisfy it.
     """
-    return request.client.host if request.client else None
+    return connection.client.host if connection.client else None
 
 
 def _peer_is_trusted_proxy(request: Request, settings: Settings) -> bool:
@@ -154,23 +158,28 @@ def require_principal(
     return resolve_principal(request)
 
 
-def _require_same_origin(request: Request, *, settings: Settings) -> None:
-    """Reject a cross-origin sign-in attempt.
+def require_same_origin(connection: HTTPConnection, *, settings: Settings) -> None:
+    """Reject a cross-origin request.
 
-    Login is exempt from the CSRF token because no session exists yet, so it needs
-    its own guard against login CSRF. Browsers send ``Origin`` on every POST, and a
-    hostile page cannot forge it. A request with no ``Origin`` at all is accepted:
-    non-browser clients such as the test suite and CLI helpers must still sign in,
-    and they are not the attack this protects against.
+    Login is exempt from the CSRF token because no session exists yet, so it
+    needs its own guard against login CSRF. Browsers send ``Origin`` on every
+    POST, and a hostile page cannot forge it. A request with no ``Origin`` at all
+    is accepted: non-browser clients such as the test suite and CLI helpers must
+    still sign in, and they are not the attack this protects against.
+
+    Also used by the transcript WebSocket before ``accept()``. The HTTP CSRF
+    middleware never sees a WebSocket upgrade, so a connection needs its own
+    origin check or a hostile page could open one with the victim's cookie and
+    read their execution output.
     """
-    origin = request.headers.get("origin")
+    origin = connection.headers.get("origin")
     if origin is None:
         return
 
     # In production the UI is served from the same origin as the API behind a
     # reverse proxy, so the deployed origin is not necessarily in cors_origins.
     # Comparing against this request's own Host covers that case.
-    host = request.headers.get("host")
+    host = connection.headers.get("host")
     if host and urlsplit(origin).netloc == host:
         return
 
@@ -179,8 +188,13 @@ def _require_same_origin(request: Request, *, settings: Settings) -> None:
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="Cross-origin sign-in is not allowed.",
+        detail="Cross-origin requests are not allowed.",
     )
+
+
+def _require_same_origin(request: Request, *, settings: Settings) -> None:
+    """Login-only spelling of :func:`require_same_origin`."""
+    require_same_origin(request, settings=settings)
 
 
 def csrf_protector(request: Request) -> None:

@@ -1,9 +1,10 @@
 /**
  * Execution history and transcript queries.
  *
- * History is polled while anything is still running, because the runner has no
- * WebSocket push yet. Once the newest run is terminal the interval stops, so a
- * calm history page makes no requests.
+ * History is polled while anything is still running. Per-host output is not
+ * polled: an open transcript follows a live WebSocket instead (see
+ * `use-transcript-stream`). Once the newest run is terminal the interval stops,
+ * so a calm history page makes no requests.
  */
 
 import { useQuery } from '@tanstack/react-query'

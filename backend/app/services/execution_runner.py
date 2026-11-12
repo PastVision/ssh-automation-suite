@@ -37,6 +37,7 @@ from app.services import conditions, execution_state, run_as, ssh_transport, var
 from app.services.concurrency import HostWorkflowLimiter, get_limiter
 from app.services.execution_log import HostTranscript
 from app.services.execution_state import HostSpec, StepSpec, VariableSpec
+from app.services.log_broadcast import get_broadcaster
 from app.services.ssh_transport import _CAPTURE_LIMIT_CHARS
 
 logger = logging.getLogger(__name__)
@@ -336,11 +337,19 @@ class ExecutionRunner:
         token: CancelToken,
     ) -> None:
         execution_state.mark_host_running(host_run_id)
+        broadcaster = get_broadcaster()
+
+        def on_chunk(text: str, start: int, end: int) -> None:
+            # Synchronous on purpose: this runs inline with SSH output, so it can
+            # only hand the frame to bounded queues. Publishing is never awaited.
+            broadcaster.publish(execution_id, host_run_id, text, start=start, end=end)
+
         transcript = HostTranscript(
             execution_id=execution_id,
             host_run_id=host_run_id,
             hostname=spec.hostname,
             settings=self.settings,
+            on_chunk=on_chunk,
         )
         with transcript:
             execution_state.set_host_log_path(host_run_id, transcript.relative_path)

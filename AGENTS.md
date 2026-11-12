@@ -236,3 +236,34 @@ rebuild of a table carrying triggers must do the same.
   defaults, and because the app creates those directories on start, a stale
   value silently recreates a deleted path instead of failing. Clear them (or
   check `GET /api/health` -> `paths`) before blaming the code.
+- `pytest` runs with `addopts = "-q"`, which suppresses the summary line when
+  everything passes. Add `-o addopts=""` to actually see `N passed`.
+- The `lab` tests need Docker (`docker compose` in `testlab/`). With Docker down
+  they skip silently — 112 skips is normal, not a failure. `SSHSUITE_REQUIRE_LAB=1`
+  turns the skip into a failure for CI.
+- The frontend lints with `oxlint` (`npm run lint`), not ESLint; there is no
+  `eslint.config.*`. It exits 0 while printing pre-existing warnings.
+- There is no frontend test runner (no vitest/testing-library). Frontend
+  correctness is therefore enforced by `tsc` and `npm run build` only, which
+  means a logic bug that still typechecks will not be caught by tooling.
+
+## Run-As resolution (the part that is easy to get wrong)
+
+A sudo password can only ever come from a `WorkflowRunAsBlock`, looked up by its
+**position**, and nothing else. Consequences worth remembering:
+
+- A step that declares its own `run_as_method` **cannot** inherit the enclosing
+  block's password: `_resolve_step_run_as` gives it `run_as_position = None`, so
+  it detaches from the block's transition entirely. A password-mode step with its
+  own method is unserviceable by construction.
+- A step naming **only** a username (no method) never requests a password; that
+  is passwordless. Inheritance applies only to steps with *no* run-as at all.
+- `step.run_as_method or RunAsMethod.NOPASSWD` is the executor's default
+  (`execution_runner.py`, `execution_state.py`). So "no method" means NOPASSWD,
+  not "inherit" — inheritance happens in the spec builder, not the runner.
+- Save-time validation is not enough on its own: a template can be edited or a
+  block's password cleared after the workflow is saved, so the check is repeated
+  in `build_execution_specs`.
+- Lab sudoers only prove something when the target *requires* a password:
+  `deploy` is NOPASSWD, `opspw` needs one. A password test pointed at `deploy`
+  passes even with the password channel completely broken.

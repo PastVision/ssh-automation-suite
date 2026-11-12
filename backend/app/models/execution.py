@@ -18,7 +18,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -42,6 +51,21 @@ class Execution(Base):
     """One run of a workflow across all of its hosts."""
 
     __tablename__ = "executions"
+    __table_args__ = (
+        # Overlap policy ``skip``, enforced by the database rather than by a
+        # check-then-insert: at most one non-terminal run per schedule. Manual
+        # runs have no schedule and never collide. This is what removes the
+        # time-of-check/time-of-use race; the dispatcher inserts and handles
+        # IntegrityError instead of looking first.
+        Index(
+            "uq_executions_one_active_per_schedule",
+            "schedule_id",
+            unique=True,
+            sqlite_where=text(
+                "schedule_id IS NOT NULL AND status IN ('pending', 'running')"
+            ),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Who started the run. Enforced when reading or cancelling an execution so one
@@ -53,6 +77,18 @@ class Execution(Base):
     workflow_id: Mapped[int | None] = mapped_column(
         ForeignKey("workflows.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # NO ACTION, not CASCADE: schedules are soft-deleted, and a hard cascade here
+    # would delete execution history along with them.
+    schedule_id: Mapped[int | None] = mapped_column(
+        ForeignKey("schedules.id", ondelete="NO ACTION"), nullable=True, index=True
+    )
+    # Snapshot so a scheduled run stays readable after the schedule row is gone
+    # from view, matching the ``workflow_name`` contract above.
+    schedule_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # The logical firing time this run was dispatched for, in UTC. Distinct from
+    # ``created_at``, which is when the row was written.
+    scheduled_for: Mapped[datetime | None] = mapped_column(nullable=True)
+
     workflow_name: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[ExecutionStatus] = mapped_column(
         enum_column(ExecutionStatus, "execution_status"),

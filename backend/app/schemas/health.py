@@ -26,12 +26,21 @@ class HealthPaths(BaseModel):
     private_key_dir: str
 
 
+class HealthScheduler(BaseModel):
+    """Scheduler liveness. `enabled` is configuration; the rest is observation."""
+
+    running: bool
+    lease_held: bool
+    generation: int | None = None
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     app: str
     version: str
     environment: str
     scheduler_enabled: bool
+    scheduler: HealthScheduler
     database: HealthDatabase
     concurrency: HealthConcurrency
     paths: HealthPaths

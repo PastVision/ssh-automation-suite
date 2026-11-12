@@ -57,6 +57,16 @@ class AuditAction(StrEnum):
     WORKFLOW_RUN_STARTED = "workflow.run_started"
     WORKFLOW_SHARED = "workflow.shared"
     WORKFLOW_UNSHARED = "workflow.unshared"
+
+    # Scheduling. Lifecycle changes are recorded against the authenticated actor;
+    # SCHEDULE_FIRED is recorded against the service principal, because no user
+    # performed it.
+    SCHEDULE_CREATED = "schedule.created"
+    SCHEDULE_UPDATED = "schedule.updated"
+    SCHEDULE_DELETED = "schedule.deleted"
+    SCHEDULE_PAUSED = "schedule.paused"
+    SCHEDULE_RESUMED = "schedule.resumed"
+    SCHEDULE_FIRED = "schedule.fired"
     # Run-As, recorded per host transition actually attempted rather than per save.
     RUN_AS_USED = "execution.run_as_used"
     RUN_AS_FAILED = "execution.run_as_failed"

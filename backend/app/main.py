@@ -20,6 +20,7 @@ from app.api.routes import credentials as credential_routes
 from app.api.routes import executions, health
 from app.api.routes import locks as lock_routes
 from app.api.routes import profile as profile_routes
+from app.api.routes import schedules as schedule_routes
 from app.api.routes import templates as template_routes
 from app.api.routes import workflows as workflow_routes
 from app.core.config import Settings, get_settings
@@ -64,9 +65,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.environment,
         settings.resolved_database_url,
     )
+
+    # Scheduling is opt-in: a single process may run the loop, but a deployment is
+    # free to run none (tests, workers, or a process dedicated to HTTP). The loop
+    # takes a lease, so enabling it everywhere is still safe -- only one holder
+    # dispatches -- but there is no reason to pay for it where it is not wanted.
+    from app.services import scheduler as scheduler_service
+
+    scheduler_task = None
+    if settings.scheduler_enabled:
+        scheduler_service.reset_scheduler()
+        scheduler_task = scheduler_service.get_scheduler().start()
+        logger.info("Scheduler started")
+    else:
+        logger.info("Scheduler disabled (SSHSUITE_SCHEDULER_ENABLED=false)")
+
     try:
         yield
     finally:
+        if scheduler_task is not None:
+            await scheduler_service.get_scheduler().stop()
+            scheduler_service.reset_scheduler()
         # Stop accepting work, let host workflows finish, then cancel what remains.
         # This runs inside the lifespan so final execution states are persisted
         # before the process exits.
@@ -108,6 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(credential_routes.router, prefix=settings.api_prefix)
     app.include_router(workflow_routes.router, prefix=settings.api_prefix)
     app.include_router(executions.router, prefix=settings.api_prefix)
+    app.include_router(schedule_routes.router, prefix=settings.api_prefix)
 
     @app.middleware("http")
     async def _csrf_guard(request: Request, call_next):

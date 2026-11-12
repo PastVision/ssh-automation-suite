@@ -28,6 +28,16 @@ from app.models.permission import (
     ResourceType,
 )
 from app.models.profile import UserSshProfile, UserSshSecret
+from app.models.schedule import (
+    MisfirePolicy,
+    PausedReason,
+    Schedule,
+    ScheduleKind,
+    ScheduleRun,
+    ScheduleRunOutcome,
+    ScheduleState,
+    SchedulerLease,
+)
 from app.models.template import (
     Template,
     TemplateStep,
@@ -57,11 +67,19 @@ __all__ = [
     "ExecutionTrigger",
     "ExecutionVariableDiscovery",
     "HostRunStatus",
+    "MisfirePolicy",
+    "PausedReason",
     "PermissionLevel",
     "RunAsMethod",
     "ResourceLock",
     "ResourcePermission",
     "ResourceType",
+    "Schedule",
+    "ScheduleKind",
+    "ScheduleRun",
+    "ScheduleRunOutcome",
+    "ScheduleState",
+    "SchedulerLease",
     "SshCredential",
     "StepRunStatus",
     "Template",

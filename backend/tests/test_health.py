@@ -16,6 +16,32 @@ def test_health_ok(client: TestClient) -> None:
     assert body["database"]["url_scheme"] == "sqlite"
     assert body["database"]["error"] is None
     assert body["scheduler_enabled"] is False
+    # Nothing started a scheduler in this process, so it must not claim to run one.
+    assert body["scheduler"] == {
+        "running": False,
+        "lease_held": False,
+        "generation": None,
+    }
+
+
+def test_health_reports_a_running_scheduler_without_starting_one(
+    client: TestClient,
+) -> None:
+    """The endpoint observes the scheduler; it must never create one as a side effect."""
+    from app.services import scheduler as scheduler_service
+
+    scheduler_service.reset_scheduler()
+    try:
+        assert client.get("/api/health").json()["scheduler"]["running"] is False
+        assert scheduler_service.peek_scheduler() is None
+
+        existing = scheduler_service.get_scheduler()
+        body = client.get("/api/health").json()
+
+        assert body["scheduler"]["running"] is False  # built, but its loop is not started
+        assert scheduler_service.peek_scheduler() is existing
+    finally:
+        scheduler_service.reset_scheduler()
 
 
 def test_health_reports_concurrency_budget(client: TestClient) -> None:
@@ -47,8 +73,10 @@ def test_openapi_exposes_only_the_intended_surface(client: TestClient) -> None:
     This is a guard, not a formality: it fails when a route appears that nobody
     intended. Workflow CRUD, minimal SSH credential management (create/list/delete,
     the minimum needed to run a workflow), execution history and host transcripts
-    are present as of the workflow-manager milestone. Scheduling, credential
-    sharing and bulk host-list management remain separate surfaces.
+    are present as of the workflow-manager milestone, and schedule CRUD (plus
+    pause/resume, firing history and a dry-run preview) as of the scheduling
+    milestone. Credential sharing and bulk host-list management remain separate
+    surfaces.
     """
     assert sorted(client.get("/openapi.json").json()["paths"]) == [
         "/api/audit",
@@ -73,6 +101,11 @@ def test_openapi_exposes_only_the_intended_surface(client: TestClient) -> None:
         "/api/profile/key-passphrase",
         "/api/profile/private-key",
         "/api/profile/sudo-password",
+        "/api/schedules",
+        "/api/schedules/preview",
+        "/api/schedules/{schedule_id}",
+        "/api/schedules/{schedule_id}/enabled",
+        "/api/schedules/{schedule_id}/runs",
         "/api/templates",
         "/api/templates/{template_id}",
         "/api/templates/{template_id}/duplicate",

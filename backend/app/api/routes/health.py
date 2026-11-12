@@ -17,8 +17,10 @@ from app.schemas.health import (
     HealthDatabase,
     HealthPaths,
     HealthResponse,
+    HealthScheduler,
 )
 from app.services.concurrency import get_limiter
+from app.services.scheduler import scheduler_status
 
 router = APIRouter(tags=["health"])
 
@@ -35,6 +37,7 @@ def health(response: Response) -> HealthResponse:
     db_ok, db_error = check_database()
     limiter = get_limiter()
     budget = limiter.snapshot()
+    scheduler = scheduler_status()
 
     if not db_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -44,7 +47,12 @@ def health(response: Response) -> HealthResponse:
         app=settings.app_name,
         version=settings.app_version,
         environment=settings.environment,
-        scheduler_enabled=False,
+        scheduler_enabled=settings.scheduler_enabled,
+        scheduler=HealthScheduler(
+            running=scheduler.running,
+            lease_held=scheduler.lease_held,
+            generation=scheduler.generation,
+        ),
         database=HealthDatabase(
             ok=db_ok,
             url_scheme=make_url(settings.resolved_database_url).drivername,

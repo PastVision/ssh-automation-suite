@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, or_, select
@@ -29,6 +30,7 @@ from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.models.audit_actions import AuditAction
 from app.models.credential import SshCredential
+from app.models.enums import ExecutionStatus, ExecutionTrigger
 from app.models.permission import ResourcePermission, ResourceType
 from app.models.template import Template, TemplateVersion
 from app.models.workflow import (
@@ -40,6 +42,8 @@ from app.models.workflow import (
     WorkflowVariable,
 )
 from app.services import audit, locks, permissions, run_as, variables
+from app.services import execution_state
+from app.services.execution_runner import get_runner
 from app.services.sessions import Principal
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,37 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.services.execution_state import HostSpec, StepSpec, VariableSpec
 
 RESOURCE = ResourceType.WORKFLOW
+
+# Audit identity for scheduled work. A scheduled run is *owned* by the schedule's
+# owner -- that is who may see and cancel it -- but it is *performed by the
+# service*, so the audit trail attributes it to this actor instead of inventing a
+# human click. ``actor_user_id`` stays NULL because no user performed it.
+SERVICE_ACTOR_USERNAME = "system:scheduler"
+
+
+@dataclass(frozen=True)
+class ScheduleLaunchContext:
+    """What a scheduled launch knows that a manual one does not."""
+
+    schedule_id: int
+    schedule_name: str
+    scheduled_for: datetime
+
+    @property
+    def detail(self) -> dict[str, object]:
+        return {"schedule_id": self.schedule_id, "scheduled_for": self.scheduled_for}
+
+
+def audit_actor_id(schedule: ScheduleLaunchContext | None, principal: Principal) -> int | None:
+    """The audit actor: NULL for scheduled work, the human for manual work."""
+    return None if schedule is not None else principal.user_id
+
+
+def audit_actor_username(
+    schedule: ScheduleLaunchContext | None, principal: Principal
+) -> str | None:
+    return SERVICE_ACTOR_USERNAME if schedule is not None else principal.label
+
 
 MAX_HOSTS = 500
 MAX_STEPS = 100
@@ -562,6 +597,9 @@ def delete(
     workflow_id: int, *, principal: Principal, remote_addr: str | None = None
 ) -> None:
     """Owner-only delete. Executions keep their own snapshots, so history survives."""
+    from app.db.types import utcnow
+    from app.models.schedule import Schedule, ScheduleState
+
     session = get_session_factory()()
     try:
         workflow = _load(session, workflow_id)
@@ -569,6 +607,27 @@ def delete(
             raise WorkflowNotFound(workflow_id)
         name = workflow.name
         entry_count = len(workflow.steps) + len(workflow.run_as_blocks)
+
+        # Retire the workflow's schedules in this transaction. The foreign key is
+        # SET NULL so the hard delete below is allowed, but a schedule left enabled
+        # would keep being scanned with no workflow to run, so it is explicitly
+        # retired here and the reason is recorded in the audit detail.
+        retired = list(
+            session.scalars(
+                select(Schedule).where(
+                    Schedule.workflow_id == workflow_id,
+                    Schedule.deleted_at.is_(None),
+                )
+            )
+        )
+        for schedule in retired:
+            schedule.deleted_at = utcnow()
+            schedule.enabled = False
+            schedule.next_run_at = None
+            schedule.state = ScheduleState.DISABLED
+            schedule.row_version = (schedule.row_version or 0) + 1
+        session.flush()
+
         session.delete(workflow)
         session.commit()
     except Exception:
@@ -586,7 +645,11 @@ def delete(
         resource_type=RESOURCE.value,
         resource_id=workflow_id,
         remote_addr=remote_addr,
-        detail={"name": name, "entries": entry_count},
+        detail={
+            "name": name,
+            "entries": entry_count,
+            "schedules_retired": len(retired),
+        },
     )
 
 
@@ -728,17 +791,31 @@ def launch(
     principal: Principal,
     hostnames: list[str] | None = None,
     remote_addr: str | None = None,
+    trigger: ExecutionTrigger = ExecutionTrigger.MANUAL,
+    schedule: ScheduleLaunchContext | None = None,
+    session: Session | None = None,
+    start_runner: bool = True,
 ) -> int:
     """Freeze the workflow and start an execution. Returns the execution id.
 
     All validation happens before any row is created, so a rejected launch leaves
     nothing behind. The execution then owns its own snapshots: editing or deleting
     this workflow afterwards cannot change or invalidate the run.
-    """
-    from app.models.enums import ExecutionTrigger
-    from app.services import execution_state
-    from app.services.execution_runner import get_runner
 
+    **This is the one execution-construction path.** Manual runs and scheduled
+    runs differ only in ``trigger``/``schedule`` and in who owns the transaction:
+
+    * manual: ``session=None``, so each write commits on its own and the runner is
+      started here.
+    * scheduled: the dispatcher passes its own session so the lease fence, the
+      ledger outcome and this insert commit atomically, and starts the runner
+      itself *after* committing (``start_runner=False``).
+
+    ``schedule`` carries the attribution split: ``actor`` is whose schedule it is
+    (the execution's owner for visibility and cancellation), while ``service_actor``
+    is the identity recorded in the audit trail, so a scheduled run is never
+    attributed to a human who did not press anything.
+    """
     workflow = get(workflow_id, principal)
     if workflow.credential_id is None:
         raise WorkflowInvalid("This workflow has no SSH credential, so it cannot run.")
@@ -747,11 +824,12 @@ def launch(
 
     steps, hosts, variable_specs = build_execution_specs(workflow, hostnames=hostnames)
 
-    runner = get_runner()
-    if runner.closing:
-        raise WorkflowConflict(
-            "The service is shutting down and cannot accept new executions."
-        )
+    if start_runner:
+        runner = get_runner()
+        if runner.closing:
+            raise WorkflowConflict(
+                "The service is shutting down and cannot accept new executions."
+            )
 
     settings = get_settings()
     execution_id = execution_state.create_execution(
@@ -759,31 +837,32 @@ def launch(
         steps=steps,
         hosts=hosts,
         variables=variable_specs,
-        trigger=ExecutionTrigger.MANUAL,
+        trigger=trigger,
         workflow_id=workflow.id,
         max_concurrent_hosts=settings.max_concurrent_host_workflows,
         created_by_id=principal.user_id,
+        schedule_id=schedule.schedule_id if schedule else None,
+        schedule_name=schedule.schedule_name if schedule else None,
+        scheduled_for=schedule.scheduled_for if schedule else None,
+        session=session,
     )
-    try:
-        runner.start(execution_id)
-    except RuntimeError as exc:
-        from app.models.enums import ExecutionStatus
 
-        execution_state.finish_execution(
-            execution_id, status=ExecutionStatus.FAILED, error_message=str(exc)
-        )
-        raise WorkflowConflict(str(exc)) from exc
+    if start_runner:
+        _start_or_fail(execution_id)
 
     audit.record(
         AuditAction.WORKFLOW_RUN_STARTED,
-        actor_id=principal.user_id,
-        actor_username=principal.label,
+        actor_id=audit_actor_id(schedule, principal),
+        actor_username=audit_actor_username(schedule, principal),
         session_id=principal.session_id,
         resource_type=RESOURCE.value,
         resource_id=workflow.id,
         remote_addr=remote_addr,
         detail={
             "execution_id": execution_id,
+            "trigger": str(trigger),
+            "schedule_id": schedule.schedule_id if schedule else None,
+            "scheduled_for": schedule.scheduled_for if schedule else None,
             "hosts": len(hosts),
             "steps": len(steps),
             "variables": len(variable_specs),
@@ -791,8 +870,20 @@ def launch(
                 1 for s in steps if s.run_as_position is not None
             ),
         },
+        session=session,
     )
     return execution_id
+
+
+def _start_or_fail(execution_id: int) -> None:
+    """Hand a committed execution to the runner, marking it failed if that fails."""
+    try:
+        get_runner().start(execution_id)
+    except RuntimeError as exc:
+        execution_state.finish_execution(
+            execution_id, status=ExecutionStatus.FAILED, error_message=str(exc)
+        )
+        raise WorkflowConflict(str(exc)) from exc
 
 
 def run_as_password(workflow: Workflow, position: int) -> str | None:

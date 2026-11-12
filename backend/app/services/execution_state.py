@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -112,6 +113,10 @@ def create_execution(
     workflow_id: int | None = None,
     max_concurrent_hosts: int = 20,
     created_by_id: int | None = None,
+    schedule_id: int | None = None,
+    schedule_name: str | None = None,
+    scheduled_for: datetime | None = None,
+    session: Session | None = None,
 ) -> int:
     """Persist a PENDING execution with frozen template snapshots.
 
@@ -122,9 +127,19 @@ def create_execution(
     Variable discovery rows are also created up front, one per variable per host,
     so a host that fails during discovery still has a row explaining which
     variable it was on rather than an empty history.
+
+    ``session`` lets a caller compose this insert into its own transaction. The
+    scheduled dispatcher needs that: the lease fence, the ledger outcome and this
+    row must commit together, and the partial unique index on ``schedule_id`` only
+    protects anything if the insert and the fence share a transaction. When a
+    session is supplied it is flushed but never committed or closed here, and the
+    log directory is *not* created until the caller's commit succeeds.
     """
     variables = variables or []
-    session = _session()
+    owns_session = session is None
+    session = session or _session()
+    log_store = ExecutionLogStore()
+    prepared_dir: Path | None = None
     try:
         execution = Execution(
             workflow_id=workflow_id,
@@ -134,6 +149,9 @@ def create_execution(
             max_concurrent_hosts=max_concurrent_hosts,
             host_count=len(hosts),
             created_by_id=created_by_id,
+            schedule_id=schedule_id,
+            schedule_name=schedule_name,
+            scheduled_for=scheduled_for,
         )
         session.add(execution)
         session.flush()
@@ -209,17 +227,45 @@ def create_execution(
                 )
 
         store = ExecutionLogStore()
-        execution.log_path = store.relative(store.prepare_execution_dir(execution.id))
-        session.commit()
+        prepared_dir = store.prepare_execution_dir(execution.id)
+        execution.log_path = store.relative(prepared_dir)
+        if owns_session:
+            session.commit()
+        else:
+            session.flush()
         execution_id = execution.id
     except Exception:
-        session.rollback()
+        # Only an owned session may be rolled back here. When the caller supplied
+        # one it is running inside a SAVEPOINT, and rolling back the outer
+        # transaction would discard the caller's ledger row too.
+        if owns_session:
+            session.rollback()
+        if prepared_dir is not None:
+            # The row is gone, so the empty directory would be an orphan. The
+            # flush precedes the commit, so a committed row can never reach here.
+            ExecutionLogStore().delete_execution_dir(execution_id)
         raise
     finally:
-        session.close()
+        if owns_session:
+            session.close()
 
-    _write_manifest(execution_id)
+    if owns_session:
+        write_execution_manifest(execution_id)
     return execution_id
+
+
+def discard_execution_dir(execution_id: int) -> None:
+    """Remove an execution's log directory. Used when a composed transaction fails."""
+    ExecutionLogStore().delete_execution_dir(execution_id)
+
+
+def write_execution_manifest(execution_id: int) -> None:
+    """Write ``manifest.json`` beside the transcripts.
+
+    Public because a caller that composes the insert into its own transaction must
+    call it *after* committing: the row does not exist before then.
+    """
+    _write_manifest(execution_id)
 
 
 def _write_manifest(execution_id: int) -> None:

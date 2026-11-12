@@ -117,7 +117,13 @@ Settings are read from environment variables prefixed `SSHSUITE_` or from
 | `SSHSUITE_SSH_KNOWN_HOSTS_FILE`           | *unset*                | Verify host keys against this file             |
 | `SSHSUITE_SSH_ALLOW_UNKNOWN_HOST_KEYS`    | `false`                | Disables verification. Test lab only.          |
 | `SSHSUITE_SHUTDOWN_GRACE_SECONDS`         | `30`                   | Grace period for in-flight runs at shutdown    |
-| `SSHSUITE_SCHEDULER_TIMEZONE`             | `UTC`                  | Timezone for scheduled workflows               |
+| `SSHSUITE_SCHEDULER_TIMEZONE`             | `UTC`                  | Default zone for a new schedule                |
+| `SSHSUITE_SCHEDULER_ENABLED`              | `false`                | Run the scheduler loop in this process         |
+| `SSHSUITE_SCHEDULER_POLL_SECONDS`         | `15`                   | How often the loop looks for due schedules     |
+| `SSHSUITE_SCHEDULER_MISFIRE_GRACE_SECONDS`| `300`                  | Default grace before a firing counts as missed |
+| `SSHSUITE_SCHEDULER_LEASE_SECONDS`        | `60`                   | How long a lease holder is trusted             |
+| `SSHSUITE_SCHEDULER_HEARTBEAT_SECONDS`    | `15`                   | Lease renewal interval                         |
+| `SSHSUITE_SCHEDULER_MAX_CATCHUP_PER_CYCLE`| `10`                   | Most missed instants resolved per schedule per cycle |
 | `SSHSUITE_AUTH_MODE`                      | `local`                 | `local` (password accounts) or `proxy`         |
 | `SSHSUITE_SESSION_IDLE_TIMEOUT_MINUTES`   | `60`                   | Session dies after this much inactivity        |
 | `SSHSUITE_SESSION_ABSOLUTE_TIMEOUT_HOURS` | `12`                   | Hard ceiling on a session's life, active or not |
@@ -131,6 +137,19 @@ working directory.
 so a plain-HTTP dev server can hold a session. Setting it to `false` with
 `SSHSUITE_ENVIRONMENT=production` is refused at startup: session cookies must not
 travel in clear text.
+
+`SSHSUITE_SCHEDULER_ENABLED` is off by default. Turn it on in exactly one process
+to fire schedules; the lease makes enabling it everywhere correct but unnecessary.
+`SSHSUITE_SCHEDULER_LEASE_SECONDS` must exceed twice
+`SSHSUITE_SCHEDULER_HEARTBEAT_SECONDS`, and startup refuses a combination that
+would let a live holder's lease expire between renewals.
+
+`/api/health` reports both the setting and the observation:
+`scheduler_enabled` is the configured flag, while `scheduler.running`,
+`scheduler.lease_held` and `scheduler.generation` describe this process. A process
+with the flag on but the lease held by a peer reports `running: true` with
+`lease_held: false` — correct, not a fault. The endpoint only observes a scheduler;
+it never starts one.
 
 ### Authentication
 
@@ -188,6 +207,45 @@ setting cannot reach a real deployment.
 
 ---
 
+### Scheduling
+
+`app/services/scheduler.py` runs one poll loop that fires due schedules; nothing
+in the HTTP layer dispatches a scheduled run.
+
+- **One loop, leased.** `scheduler_lease` is a single row with a `generation`
+  counter. A process holds the lease to dispatch; a superseded holder is fenced by
+  a guarded write, so two processes cannot both fire the same schedule. This is why
+  the loop is safe to enable everywhere and why enabling it nowhere also works.
+- **The ledger is the source of truth.** `schedule_runs` has a unique
+  `(schedule_id, scheduled_for)`, written **before** any execution exists. A
+  duplicated firing is absorbed by the constraint rather than by a check-then-insert,
+  which removes the time-of-check/time-of-use race.
+- **Missed firings are recorded, not lost.** A firing that was skipped is a row with
+  a reason, so "why did my workflow not run at 03:00?" is answerable.
+- **Misfire policy** is per schedule. `skip` records every late instant and runs
+  none; `run_once` collapses a burst to its newest instant and records the rest.
+  `misfire_grace_seconds` decides what counts as late, so a briefly delayed loop
+  still runs on time.
+- **Catch-up is bounded.** At most `scheduler_max_catchup_per_cycle` instants are
+  resolved per schedule per cycle, oldest first, leaving the cursor behind so the
+  remainder is still plainly due next cycle. No instant is stranded in the middle.
+- **Crash recovery is the same walk.** There is no separate recovery path: a
+  schedule whose cursor is in the past simply has due instants when the loop next
+  runs. `last_fired_for` moves only after a firing has been decided, which is what
+  makes replay safe.
+- **Overlap is refused in the database.** A partial unique index on
+  `executions (workflow_id)` where the status is live means a second firing of the
+  same workflow cannot start while one is running.
+- **Everything persisted is UTC.** A schedule stores an IANA zone name and, for
+  recurring schedules, a 5-field cron expression. Weekday numbering is translated
+  explicitly: APScheduler 3.x numbers `day_of_week` Monday=0 while crontab numbers it
+  Sunday=0, a documented upstream mismatch that would otherwise silently fire
+  `0 9 * * 1` on Tuesday.
+- **One-time schedules are terminal.** A `once` schedule ends as `completed`,
+  `missed` or `cancelled`; editing its run time re-arms it.
+
+---
+
 ## Data model
 
 Ten application tables, created by the initial Alembic revision. Alembic also
@@ -207,6 +265,18 @@ execution_host_runs             one row per (execution, hostname): status, log p
 execution_step_runs             one row per (host_run, step): status, exit code, log path
 alembic_version                 Alembic's own migration bookkeeping (not domain data)
 ```
+
+Three tables added by the scheduling revision:
+
+```
+schedules                       definition: kind, cron/run_at, zone, misfire policy, cursor
+schedule_runs                   append-only firing ledger: one row per logical firing instant
+scheduler_lease                 single-row (id = 1) arbitration: holder, generation, expiry
+```
+
+`executions` also gained `schedule_id`, `schedule_name` and `scheduled_for`, so a
+run records which schedule produced it without a join that could outlive the
+schedule.
 
 Design choices worth knowing:
 
@@ -276,8 +346,38 @@ application nor able to reach its database or encryption key. See
 | `GET`  | `/api/executions/{id}`            | Execution detail: per-host and per-step status.     |
 | `POST` | `/api/executions/{id}/cancel`     | Request cooperative cancellation.                   |
 
-An execution is started by supplying the steps and hosts inline, because template
-and workflow CRUD do not exist yet:
+Schedules are managed under their own surface. Creating one stores the definition
+and computes the first firing; **the scheduler loop does the dispatching**, so a
+`POST` here never starts a run itself.
+
+| Method   | Path                                   | Description                                              |
+| -------- | -------------------------------------- | -------------------------------------------------------- |
+| `GET`    | `/api/schedules`                       | Schedules the caller can see (optionally by `workflow_id`). |
+| `POST`   | `/api/schedules`                       | Create a schedule.                                       |
+| `POST`   | `/api/schedules/preview`               | Dry-run: the next firings for a timing definition.        |
+| `GET`    | `/api/schedules/{id}`                  | Read one schedule.                                        |
+| `PUT`    | `/api/schedules/{id}`                  | Replace its definition (needs `row_version`).             |
+| `POST`   | `/api/schedules/{id}/enabled`          | Pause or resume.                                          |
+| `DELETE` | `/api/schedules/{id}`                  | Soft delete; the firing ledger survives.                   |
+| `GET`    | `/api/schedules/{id}/runs`             | Firing history: every instant and its outcome.             |
+
+```jsonc
+POST /api/schedules
+{
+  "name": "nightly",
+  "workflow_id": 3,
+  "schedule_kind": "cron",          // once | daily | weekly | monthly | cron
+  "timezone": "Europe/Berlin",
+  "cron_expression": "0 3 * * *",   // standard 5-field crontab, Sunday = 0
+  "misfire_policy": "skip",         // skip | run_once
+  "misfire_grace_seconds": 300
+}
+```
+
+A `once` schedule takes `run_at` instead of `cron_expression`. A write with a stale
+`row_version` answers `409`; a schedule the caller cannot see answers `404`.
+
+An execution can also be started directly, with its steps and hosts inline:
 
 ```jsonc
 POST /api/executions
@@ -292,6 +392,9 @@ POST /api/executions
 Read `GET /api/executions/{id}` to see `status` (`pending` -> `running` ->
 `succeeded` / `failed` / `cancelled`), and each host's `log_path`. Response bodies
 never contain private key material.
+
+A scheduled run appears in the same execution history with `schedule_id` and
+`scheduled_for` set, so the two paths are read through one surface.
 
 ---
 
@@ -366,7 +469,7 @@ isolation, the global concurrency ceiling, cancellation, and shutdown.
 | **2 (done)** | SSH credentials, versioned templates, workflows, execution history, log store, SSH test lab |
 | **3 (done)** | SSH execution engine: 20-host concurrency, sequential steps, fail-fast per host, cancellation, shutdown |
 | 4 (partial) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming: **not implemented**, the UI polls over HTTP |
-| 5 | APScheduler scheduling |
+| **5 (done)** | APScheduler scheduling: one-time and recurring schedules, firing ledger, misfire policy, lease-based single dispatcher, bounded catch-up. Schedules API only; no scheduling UI yet |
 | **6 (done)** | End-to-end workflow authoring in the UI: editor, host list, variables, run monitor, execution detail |
 
 ---

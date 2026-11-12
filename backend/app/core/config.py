@@ -50,6 +50,26 @@ class Settings(BaseSettings):
     # Ceiling for host workflows running at the same time across all executions.
     max_concurrent_host_workflows: int = Field(default=20, ge=1, le=200)
     scheduler_timezone: str = "UTC"
+
+    # --- Scheduler ----------------------------------------------------------
+    # Off by default so a second worker, a test run, or a developer's shell never
+    # competes for the lease by accident. One process in a deployment sets it.
+    scheduler_enabled: bool = False
+    # How often the loop looks for due firings. Sub-minute values only create
+    # load; the loop is idempotent, so a slower tick delays runs but loses none.
+    scheduler_poll_seconds: float = Field(default=15.0, gt=0, le=300)
+    # Lateness beyond which a firing is treated as missed and the misfire policy
+    # applies, instead of being dispatched immediately.
+    scheduler_misfire_grace_seconds: int = Field(default=300, ge=0, le=86400)
+    # Lease lifetime and renewal cadence. Must satisfy
+    # ``scheduler_lease_seconds > 2 * scheduler_heartbeat_seconds`` so a holder is
+    # always renewed well before it could expire.
+    scheduler_lease_seconds: int = Field(default=60, ge=10, le=3600)
+    scheduler_heartbeat_seconds: int = Field(default=15, ge=1, le=600)
+    # Upper bound on firings recovered per schedule after downtime, so a schedule
+    # that has been down for months cannot produce a dispatch storm.
+    scheduler_max_catchup_per_cycle: int = Field(default=10, ge=1, le=1000)
+
     log_level: str = "INFO"
 
     # --- SSH transport ------------------------------------------------------
@@ -207,6 +227,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ssh_allow_unknown_host_keys cannot be enabled when environment='production'. "
                 "Verify host keys against ssh_known_hosts_file instead."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _guard_scheduler_timing(self) -> Settings:
+        """Refuse a lease that can expire before it is renewed.
+
+        A lease shorter than two heartbeats would let a healthy holder be judged
+        dead between renewals, which turns the single-writer guarantee into flapping
+        double dispatch. Rejecting the configuration is cheaper than debugging it.
+        """
+        if self.scheduler_lease_seconds <= 2 * self.scheduler_heartbeat_seconds:
+            raise ValueError(
+                "scheduler_lease_seconds must exceed twice scheduler_heartbeat_seconds "
+                f"({self.scheduler_lease_seconds} <= 2 * {self.scheduler_heartbeat_seconds})."
             )
         return self
 

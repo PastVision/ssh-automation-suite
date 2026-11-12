@@ -245,25 +245,21 @@ def test_representative_earlier_revision_carries_data_forward(tmp_path: Path) ->
     url = migration_support.sqlite_url(database)
     migration_support.upgrade_to(url, "b3f7c1d92a4e")
 
-    # Write through the ORM so required columns receive their model defaults
-    # instead of the test hard-coding every NOT NULL column by hand.
-    from sqlalchemy.orm import Session
-
-    from app.models import Execution, ExecutionStatus
-
-    engine = migration_support.database_engine(database)
+    # Raw SQL naming only columns that existed at this revision. Writing through
+    # the current ORM would emit every column it knows about, including ones this
+    # revision does not have, and so would test the ORM rather than the migration.
+    connection = sqlite3.connect(str(database))
     try:
-        with Session(engine) as session:
-            session.add(
-                Execution(
-                    workflow_name="legacy-run",
-                    status=ExecutionStatus.SUCCEEDED,
-                    host_count=1,
-                )
-            )
-            session.commit()
+        connection.execute(
+            "INSERT INTO executions "
+            "(workflow_name, status, \"trigger\", max_concurrent_hosts, host_count, "
+            " succeeded_host_count, failed_host_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-run", "succeeded", "manual", 20, 1, 0, 0, "2026-01-01 00:00:00"),
+        )
+        connection.commit()
     finally:
-        engine.dispose()
+        connection.close()
 
     migration_support.upgrade_to(url, "head")
 
@@ -767,9 +763,10 @@ def test_undeclared_server_defaults_are_known(migrated_template_db: Path) -> Non
 def test_check_constraints_present_in_migrations_are_enumerated(migrated_template_db: Path) -> None:
     """Record which CHECK constraints the migrations actually create.
 
-    The models declare none today, so a non-empty result means a migration added
-    one outside the ORM's knowledge. The test pins the current state explicitly
-    rather than skipping the check, so adding one is a deliberate, visible change.
+    The only CHECK today is the ``scheduler_lease`` single-row guard, which *is*
+    declared in the model, so a diff against that list means a migration added one
+    outside the ORM's knowledge. Pinned explicitly rather than skipped, so adding
+    another is a deliberate, visible change.
     """
     import re
 
@@ -790,4 +787,9 @@ def test_check_constraints_present_in_migrations_are_enumerated(migrated_templat
     with_check = {
         table: sql for table, sql in definitions.items() if sql and pattern.search(sql)
     }
-    assert with_check == {}, f"unexpected CHECK constraints discovered: {sorted(with_check)}"
+    assert set(with_check) == {"scheduler_lease"}, (
+        "unexpected CHECK constraints discovered: "
+        f"{sorted(set(with_check) - {'scheduler_lease'})}"
+    )
+    # The lease table must never accept a second row; that is its whole job.
+    assert "id = 1" in with_check["scheduler_lease"]

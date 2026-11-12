@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
+
 
 def test_health_ok(client: TestClient) -> None:
     response = client.get("/api/health")
@@ -60,11 +62,11 @@ def test_health_reports_directories(client: TestClient, settings) -> None:
     assert body["paths"]["private_key_dir"] == str(settings.private_key_dir)
 
 
-def test_root_metadata(client: TestClient) -> None:
+def test_root_metadata(client: TestClient, settings: Settings) -> None:
     body = client.get("/").json()
 
     assert body["health"] == "/api/health"
-    assert body["version"] == "0.1.0"
+    assert body["version"] == settings.app_version
 
 
 def test_openapi_exposes_only_the_intended_surface(client: TestClient) -> None:

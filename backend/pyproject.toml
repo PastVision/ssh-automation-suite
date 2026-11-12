@@ -1,6 +1,6 @@
 [project]
 name = "ssh-automation-suite-backend"
-version = "0.1.0"
+version = "1.0.0"
 description = "Backend API for the SSH Automation Suite"
 requires-python = ">=3.11"
 dependencies = [

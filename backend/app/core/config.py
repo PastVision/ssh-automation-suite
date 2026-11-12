@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "SSH Automation Suite"
-    app_version: str = "0.1.0"
+    app_version: str = "1.0.0"
     environment: Literal["development", "test", "production"] = "development"
     api_prefix: str = "/api"
     debug: bool = False

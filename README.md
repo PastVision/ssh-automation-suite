@@ -4,12 +4,15 @@ Run reusable shell-script templates over SSH across many hosts, from a small
 self-hosted web UI. No Redis, no Celery, no Kubernetes — one FastAPI process, a
 SQLite file, and logs on disk.
 
-> **Status: Milestones 1-7 complete.**
+> **Status: Milestones 1-8 complete.**
 > Credentials, versioned templates, workflows, the SSH execution engine,
 > end-to-end workflow authoring and scheduling in the browser, APScheduler-based
 > execution and live transcript streaming all work against the local Docker SSH
 > lab. Per-host transcripts stream over a WebSocket; the run's own status is
 > polled, which is deliberate -- the stream carries output, not aggregate state.
+> Milestone 8 hardened the release: runtime paths now anchor to the backend
+> directory, and the test suite is isolated from the real data and log
+> directories.
 > See [Roadmap](#roadmap) for what each milestone covers.
 
 ---
@@ -323,7 +326,8 @@ Design choices worth knowing:
 │   └── src/
 │       ├── components/ui/     shadcn/ui primitives
 │       ├── components/layout/ app shell, sidebar, nav config
-│       ├── pages/             dashboard + four placeholders
+│       ├── pages/             dashboard, credentials, templates, workflows,
+│       │                      executions, settings, account, login
 │       ├── lib/               API client, shared types
 │       └── hooks/             React Query hooks
 └── testlab/                 SSH integration test lab (independent of the app)

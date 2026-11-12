@@ -138,7 +138,7 @@ export function WorkflowsPage() {
         <div className="relative flex-1 sm:max-w-xs">
           <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
           <input
-            className="bg-background focus-visible:ring-ring/50 w-full rounded-md border py-1.5 pr-2.5 pl-8 text-sm outline-none focus-visible:ring-[3px]"
+            className="border-input bg-background focus-visible:ring-ring w-full rounded-md border py-1.5 pr-2.5 pl-8 text-sm outline-none focus-visible:ring-[3px]"
             placeholder="Search name or description"
             value={search}
             onChange={(event) => setSearch(event.target.value)}

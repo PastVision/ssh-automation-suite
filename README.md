@@ -443,7 +443,23 @@ cd frontend
 npm run dev
 npm run build     # typecheck (tsc -b) + production bundle
 npm run lint
+npm run check:contrast   # WCAG AA audit of the theme tokens in src/index.css
 ```
+
+There is no frontend test runner, so `tsc`, the build and `check:contrast` are the
+only automated checks. Two conventions in `src/index.css` are load-bearing and
+easy to undo by accident:
+
+- **Contrast.** Text/background pairs meet WCAG AA (4.5:1; 3:1 for borders and
+  focus rings) in both themes. Two traps: a tinted surface pulls its backdrop
+  toward the foreground, so `bg-<token>/15` can push a passing pair below 4.5:1
+  (badges and diff lines therefore use `/10` or `/5`); and `--border` is a
+  decorative divider while `--input` bounds a form control, so only `--input`
+  carries the 3:1 requirement. Re-run `npm run check:contrast` after touching a
+  token, and do not add `ring-*/50` style opacity modifiers to focus indicators.
+- **State is never color-only.** Status pills carry a distinct glyph per state, the
+  active nav item has a bar plus font weight, and the `Notice` tones have an icon
+  and explicit wording. Keep the icon when adding a new state.
 
 ### Tests
 

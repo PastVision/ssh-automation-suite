@@ -10,7 +10,7 @@
  * of `position` values, because the backend derives positions from array order.
  */
 
-import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react'
+import { AlertCircle, AlertTriangle, ArrowDown, ArrowUp, Info, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -548,7 +548,7 @@ export function TemplateEditor({
 }
 
 const inputClass =
-  'w-full rounded-md border bg-background px-2.5 py-1.5 text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50'
+  'border-input bg-background w-full rounded-md border px-2.5 py-1.5 text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring disabled:opacity-50'
 
 export function Notice({
   tone,
@@ -561,14 +561,19 @@ export function Notice({
     <div
       role="status"
       className={cn(
-        'rounded-md border px-3 py-2 text-sm',
+        'flex items-start gap-2 rounded-md border px-3 py-2 text-sm',
         tone === 'warning' &&
-          'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-200',
+          'border-amber-600 bg-amber-500/10 text-amber-900 dark:text-amber-200',
         tone === 'muted' && 'bg-muted/50 text-muted-foreground',
-        tone === 'danger' && 'border-destructive/40 bg-destructive/10 text-destructive',
+        tone === 'danger' && 'border-destructive bg-destructive/5 text-destructive',
       )}
     >
-      {children}
+      {/* The icon is what distinguishes the tones for a viewer who cannot separate
+          the hues; every tone already carries its meaning in words. */}
+      {tone === 'warning' && <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      {tone === 'danger' && <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      {tone === 'muted' && <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      <div className="min-w-0 flex-1">{children}</div>
     </div>
   )
 }

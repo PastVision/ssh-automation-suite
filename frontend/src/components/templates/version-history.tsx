@@ -78,8 +78,10 @@ function DiffColumn({ ops }: { ops: DiffOp[] }) {
           key={index}
           className={cn(
             'whitespace-pre',
-            op.kind === 'added' && 'bg-emerald-500/15 text-emerald-900 dark:text-emerald-200',
-            op.kind === 'removed' && 'bg-destructive/15 text-destructive',
+            // emerald-950/emerald-300 (not -900/-200) and a 10% tint keep the
+            // diff text above 4.5:1 in both themes; measured, not eyeballed.
+            op.kind === 'added' && 'bg-emerald-500/10 text-emerald-950 dark:text-emerald-300',
+            op.kind === 'removed' && 'bg-destructive/5 text-destructive',
           )}
         >
           <span className="select-none opacity-50">

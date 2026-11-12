@@ -12,8 +12,11 @@ const badgeVariants = cva(
         secondary: 'border-transparent bg-secondary text-secondary-foreground',
         destructive: 'border-transparent bg-destructive text-destructive-foreground',
         outline: 'text-foreground',
-        success: 'border-transparent bg-success/15 text-success',
-        warning: 'border-transparent bg-warning/15 text-warning',
+        // 10%, not 15%: the tint darkens the backdrop toward the foreground, and
+        // at 15% the dark-theme pair falls to ~4.2:1. See the contrast note in the
+        // README's Frontend section.
+        success: 'border-transparent bg-success/10 text-success',
+        warning: 'border-transparent bg-warning/10 text-warning',
       },
     },
     defaultVariants: {

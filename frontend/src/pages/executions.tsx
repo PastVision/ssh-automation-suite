@@ -224,7 +224,7 @@ function HostFailure({
     return <p className="text-destructive mt-2 text-xs">{message}</p>
   }
   return (
-    <div className="border-destructive/40 bg-destructive/5 mt-2 rounded-md border p-2">
+    <div className="border-destructive bg-destructive/5 mt-2 rounded-md border p-2">
       <p className="text-destructive text-xs font-medium">{diagnosis.summary}</p>
       <p className="text-muted-foreground mt-1 text-xs">{diagnosis.action}</p>
       <details className="mt-1">

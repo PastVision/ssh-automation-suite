@@ -67,7 +67,7 @@ export function DashboardPage() {
               ))}
             </div>
           ) : error ? (
-            <div className="border-destructive/30 bg-destructive/5 flex items-start gap-3 rounded-lg border p-4">
+            <div className="border-destructive bg-destructive/5 flex items-start gap-3 rounded-lg border p-4">
               <XCircle aria-hidden="true" className="text-destructive mt-0.5 size-4" />
               <div className="space-y-1 text-sm">
                 <p className="font-medium">Cannot reach the backend</p>

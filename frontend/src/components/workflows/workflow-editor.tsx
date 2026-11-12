@@ -15,7 +15,7 @@
  * user has no way to act on.
  */
 
-import { ArrowDown, ArrowUp, GripVertical, Plus, Trash2 } from 'lucide-react'
+import { AlertCircle, AlertTriangle, ArrowDown, ArrowUp, GripVertical, Info, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -47,7 +47,7 @@ import type {
 import { cn } from '@/lib/utils'
 
 const inputClass =
-  'w-full rounded-md border bg-background px-2.5 py-1.5 text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50'
+  'border-input bg-background w-full rounded-md border px-2.5 py-1.5 text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring disabled:opacity-50'
 
 const MAX_HOSTS = 500
 const MAX_STEPS = 100
@@ -56,6 +56,22 @@ const MAX_STEPS = 100
 const RUN_AS_NAME = /^[a-z_][a-z0-9_-]{0,31}$/
 /** Mirrors `variables.NAME_PATTERN`. */
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
+
+/**
+ * The one message shown for a variable name that is missing or malformed.
+ *
+ * Shared by the inline row warning and by `validateWorkflow` so the two never
+ * disagree about the same input. An empty name gets its own wording: the rules
+ * about first characters are noise when there is nothing typed yet.
+ */
+function variableNameHint(rawName: string): string | null {
+  const name = rawName.trim()
+  if (name === '') return 'give it a name.'
+  if (!VARIABLE_NAME.test(name)) {
+    return 'use letters, digits and underscore, starting with a letter or underscore, at most 64 characters.'
+  }
+  return null
+}
 
 export type DraftEntry =
   | { key: string; kind: 'template'; template_id: number | '' }
@@ -234,11 +250,11 @@ export function validateWorkflow(state: EditorState): string | null {
   const seenVariables = new Set<string>()
   for (const variable of state.variables) {
     const name = variable.name.trim()
-    if (!VARIABLE_NAME.test(name)) {
+    const nameHint = variableNameHint(name)
+    if (nameHint) {
       // Named after the row's position and its current text, so the operator can
-      // find the offending field without counting: a fresh, untouched row must
-      // not read as an error about "" being malformed.
-      return `Variable ${describeVariable(variable)} has an invalid name: use letters, digits and underscore, starting with a letter or underscore, at most 64 characters.`
+      // find the offending field without counting.
+      return `Variable ${describeVariable(variable)}: ${nameHint}`
     }
     if (seenVariables.has(name)) return `Variable "${name}" is defined more than once.`
     seenVariables.add(name)
@@ -853,27 +869,40 @@ export function WorkflowEditor({
             ) : (
               <div className="space-y-2">
                 {state.variables.map((variable, index) => {
-                  const nameProblem =
-                    variable.name.trim() !== '' && !VARIABLE_NAME.test(variable.name.trim())
+                  // A row nobody has typed into yet must not look like a mistake:
+                  // the same wording is shown, but muted instead of red. The save
+                  // button is already disabled by `validation` either way.
+                  const untouched = variable.name.trim() === ''
+                  const nameHint = variableNameHint(variable.name)
                   return (
                     <div key={variable.key} className="bg-card rounded-lg border p-3">
                       <div className="grid gap-2 sm:grid-cols-[1fr_9rem_5rem_auto]">
                         <label className="space-y-1 text-xs">
                           <span className="text-muted-foreground">Name</span>
                           <input
-                            className={cn(inputClass, nameProblem && 'border-destructive')}
+                            className={cn(
+                              inputClass,
+                              nameHint && !untouched && 'border-destructive',
+                            )}
                             value={variable.name}
                             maxLength={64}
-                            aria-invalid={nameProblem || undefined}
+                            aria-invalid={nameHint && !untouched ? true : undefined}
+                            aria-describedby={`${variable.key}-name-hint`}
                             onChange={(event) =>
                               updateVariable(index, { name: event.target.value })
                             }
                             placeholder="hostname_fqdn"
                             aria-label={`Variable ${index + 1} name`}
                           />
-                          {nameProblem ? (
-                            <span className="text-destructive block">
-                              Letters, digits and underscore only.
+                          {nameHint ? (
+                            <span
+                              id={`${variable.key}-name-hint`}
+                              className={cn(
+                                'block',
+                                untouched ? 'text-muted-foreground' : 'text-destructive',
+                              )}
+                            >
+                              {nameHint}
                             </span>
                           ) : null}
                         </label>
@@ -1110,14 +1139,19 @@ export function Notice({
     <div
       role="status"
       className={cn(
-        'rounded-md border px-3 py-2 text-sm',
+        'flex items-start gap-2 rounded-md border px-3 py-2 text-sm',
         tone === 'warning' &&
-          'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-200',
+          'border-amber-600 bg-amber-500/10 text-amber-900 dark:text-amber-200',
         tone === 'muted' && 'bg-muted/50 text-muted-foreground',
-        tone === 'danger' && 'border-destructive/40 bg-destructive/10 text-destructive',
+        tone === 'danger' && 'border-destructive bg-destructive/5 text-destructive',
       )}
     >
-      {children}
+      {/* The icon is what distinguishes the tones for a viewer who cannot separate
+          the hues; every tone already carries its meaning in words. */}
+      {tone === 'warning' && <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      {tone === 'danger' && <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      {tone === 'muted' && <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
+      <div className="min-w-0 flex-1">{children}</div>
     </div>
   )
 }

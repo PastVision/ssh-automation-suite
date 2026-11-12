@@ -1069,3 +1069,110 @@ def test_mutations_require_csrf(app_client, alice) -> None:
     assert client.post(
         "/api/templates", json={"name": "x"}, headers={"X-CSRF-Token": "wrong"}
     ).status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Per-step Run-As persistence
+# --------------------------------------------------------------------------- #
+#
+# The executor reads ``step.run_as_username`` when it builds a host's command
+# list, so a write path that accepts the field and then drops it would run the
+# step as the login user while the UI showed a target. These cover the whole
+# round trip: create, read back, edit, and the immutable version snapshot.
+
+
+def _run_as_steps() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "privileged",
+            "script": "id -un",
+            "interpreter": "bash",
+            "timeout_seconds": 60,
+            "run_as_username": "deploy",
+            "run_as_method": "nopasswd",
+        },
+        {
+            "name": "plain",
+            "script": "id -un",
+            "interpreter": "bash",
+            "timeout_seconds": 60,
+        },
+    ]
+
+
+def test_run_as_survives_the_round_trip(app_client, alice) -> None:
+    client, token = alice
+    created = _create(client, token, steps=_run_as_steps())
+    assert created.status_code == 201, created.text
+    body = created.json()
+
+    assert body["steps"][0]["run_as_username"] == "deploy"
+    assert body["steps"][0]["run_as_method"] == "nopasswd"
+    # Omitted means "run as the SSH login user", which must stay None rather
+    # than defaulting to something the operator never asked for.
+    assert body["steps"][1]["run_as_username"] is None
+    assert body["steps"][1]["run_as_method"] is None
+
+    read = client.get(f"/api/templates/{body['id']}").json()
+    assert read["steps"][0]["run_as_username"] == "deploy"
+
+
+def test_run_as_is_captured_in_the_version_snapshot(app_client, alice) -> None:
+    """History is what proves what a past run actually executed."""
+    client, token = alice
+    created = _create(client, token, steps=_run_as_steps()).json()
+
+    versions = client.get(f"/api/templates/{created['id']}/versions").json()
+    assert versions
+    snapshot = client.get(
+        f"/api/templates/{created['id']}/versions/{versions[0]['version']}"
+    ).json()
+
+    assert snapshot["steps"][0]["run_as_username"] == "deploy"
+    assert snapshot["steps"][0]["run_as_method"] == "nopasswd"
+
+
+def test_editing_run_as_appends_a_new_version(app_client, alice) -> None:
+    """Changing only the Run-As target is a content change, not a no-op save."""
+    client, token = alice
+    created = _create(client, token, steps=_run_as_steps()).json()
+
+    changed = [dict(step) for step in _run_as_steps()]
+    changed[0]["run_as_username"] = "opspw"
+    changed[0]["run_as_method"] = "password"
+
+    saved = _edit_with_lock(
+        client,
+        token,
+        created["id"],
+        {
+            "name": created["name"],
+            "description": created["description"],
+            "steps": changed,
+            "row_version": created["row_version"],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["current_version"] == created["current_version"] + 1
+    assert saved.json()["steps"][0]["run_as_username"] == "opspw"
+    assert saved.json()["steps"][0]["run_as_method"] == "password"
+
+
+def test_a_no_op_save_does_not_inflate_history(app_client, alice) -> None:
+    """The checksum must ignore Run-As for steps that never used it."""
+    client, token = alice
+    created = _create(client, token, steps=_steps(("usage", "df -h"))).json()
+
+    saved = _edit_with_lock(
+        client,
+        token,
+        created["id"],
+        {
+            "name": created["name"],
+            "description": created["description"],
+            "steps": _steps(("usage", "df -h")),
+            "row_version": created["row_version"],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["current_version"] == created["current_version"]

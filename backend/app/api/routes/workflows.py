@@ -39,7 +39,7 @@ from app.schemas.workflow import (
     WorkflowSummary,
     WorkflowUpdate,
 )
-from app.services import locks, sessions, workflows
+from app.services import execution_state, locks, sessions, workflows
 from app.services.identity import client_ip, require_principal
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,10 @@ def _detail(workflow: Workflow, principal: sessions.Principal) -> WorkflowDetail
         credential_id=workflow.credential_id,
         row_version=workflow.row_version,
         can_edit=workflows.can_edit(workflow, principal),
+        can_run=workflows.can_run(workflow, principal),
         is_owner=workflows.is_owner(workflow, principal),
+        visibility=workflow.visibility,
+        execution_permission=workflow.execution_permission,
         entries=_entries_read(workflow),
         variables=[VariableRead.model_validate(v) for v in workflow.variables],
         hosts=[HostRead.model_validate(h) for h in workflow.hosts],
@@ -143,7 +146,9 @@ def _detail(workflow: Workflow, principal: sessions.Principal) -> WorkflowDetail
     )
 
 
-def _summary(workflow: Workflow, principal: sessions.Principal) -> WorkflowSummary:
+def _summary(
+    workflow: Workflow, principal: sessions.Principal, *, active_execution_count: int = 0
+) -> WorkflowSummary:
     return WorkflowSummary(
         id=workflow.id,
         name=workflow.name,
@@ -151,7 +156,11 @@ def _summary(workflow: Workflow, principal: sessions.Principal) -> WorkflowSumma
         owner_id=workflow.owner_id,
         row_version=workflow.row_version,
         can_edit=workflows.can_edit(workflow, principal),
+        can_run=workflows.can_run(workflow, principal),
         is_owner=workflows.is_owner(workflow, principal),
+        visibility=workflow.visibility,
+        execution_permission=workflow.execution_permission,
+        active_execution_count=active_execution_count,
         step_count=len(workflow.steps),
         run_as_count=len(workflow.run_as_blocks),
         variable_count=len(workflow.variables),
@@ -200,8 +209,16 @@ def list_workflows(
     principal: sessions.Principal = Depends(require_principal),
 ) -> WorkflowListResponse:
     items = workflows.list_for_user(principal, search=search)
+    # One query for every workflow's running count; see
+    # ``execution_state.active_counts_by_workflow``.
+    active_counts = execution_state.active_counts_by_workflow()
     return WorkflowListResponse(
-        items=[_summary(workflow, principal) for workflow in items]
+        items=[
+            _summary(
+                workflow, principal, active_execution_count=active_counts.get(workflow.id, 0)
+            )
+            for workflow in items
+        ]
     )
 
 

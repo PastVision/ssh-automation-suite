@@ -39,6 +39,8 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from app.models.enums import VariableSource
+
 # A name must be a valid shell identifier so a value can never be confused with
 # syntax, and so the workflow editor can present it next to `$HOME` safely.
 NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
@@ -51,6 +53,11 @@ MAX_NAME_LENGTH = 64
 MAX_VARIABLES = 64
 MAX_VALUE_CHARS = 64 * 1024
 MAX_RENDERED_CHARS = 1024 * 1024
+# A static value is typed by the operator, not captured from a host, so it is
+# bounded more tightly than a discovery result: it exists to parameterise a
+# script, not to carry a file.
+MAX_STATIC_VALUE_CHARS = 8 * 1024
+MAX_DISCOVERY_COMMAND_CHARS = 8 * 1024
 
 _HEREDOC_PATTERN = re.compile(r"<<(-?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 
@@ -94,6 +101,90 @@ def validate_unique(names: Sequence[str]) -> None:
         raise RenderError(
             f"A workflow may define at most {MAX_VARIABLES} variables (found {len(seen)})."
         )
+
+
+@dataclass(frozen=True)
+class VariableDefinition:
+    """One variable as the editor submitted it, before validation.
+
+    A plain value object rather than the ORM row so the same rules apply to a
+    workflow save, an execution freeze and a test, and so validation has no
+    database dependency.
+    """
+
+    name: str
+    source: VariableSource
+    discovery_command: str = ""
+    static_value: str | None = None
+    timeout_seconds: int = 30
+
+
+def validate_definition(definition: VariableDefinition) -> VariableDefinition:
+    """Validate one variable and return it normalised.
+
+    The two sources have deliberately disjoint requirements: a command-backed
+    variable must have a command and no static value, and a user-defined one must
+    have a value and no command. Rejecting the unused field rather than ignoring
+    it is what stops a variable from silently changing source when an editor
+    clears the wrong box.
+    """
+    name = validate_name(definition.name)
+    command = (definition.discovery_command or "").strip()
+    static = definition.static_value
+
+    if definition.source is VariableSource.COMMAND_OUTPUT:
+        if not command:
+            raise RenderError(
+                f"Variable {name!r} uses command output, so it needs a discovery "
+                "command."
+            )
+        if len(command) > MAX_DISCOVERY_COMMAND_CHARS:
+            raise RenderError(
+                f"Variable {name!r} has a discovery command longer than "
+                f"{MAX_DISCOVERY_COMMAND_CHARS} characters."
+            )
+        if static:
+            raise RenderError(
+                f"Variable {name!r} uses command output and cannot also carry a "
+                "static value."
+            )
+        static = None
+    else:
+        if static is None:
+            raise RenderError(
+                f"Variable {name!r} is user-defined, so it needs a value."
+            )
+        if len(static) > MAX_STATIC_VALUE_CHARS:
+            raise RenderError(
+                f"Variable {name!r} has a value longer than "
+                f"{MAX_STATIC_VALUE_CHARS} characters."
+            )
+        if command:
+            raise RenderError(
+                f"Variable {name!r} is user-defined, so it cannot also have a "
+                "discovery command."
+            )
+        command = ""
+
+    if not 1 <= definition.timeout_seconds <= 3600:
+        raise RenderError(
+            f"Variable {name!r} needs a timeout between 1 and 3600 seconds."
+        )
+
+    return VariableDefinition(
+        name=name,
+        source=definition.source,
+        discovery_command=command,
+        static_value=static,
+        timeout_seconds=definition.timeout_seconds,
+    )
+
+
+def validate_definitions(definitions: Sequence[VariableDefinition]) -> list[VariableDefinition]:
+    """Validate a whole variable list: per-variable rules plus uniqueness."""
+    validated = [validate_definition(definition) for definition in definitions]
+    validate_unique([definition.name for definition in validated])
+    return validated
 
 
 def _quote_for_bare(value: str) -> str:

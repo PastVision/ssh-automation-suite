@@ -21,19 +21,45 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.types import enum_column, timestamp_column
-from app.models.enums import ExecutionTrigger
+from app.models.enums import ExecutionTrigger, RunAsMethod, VariableSource
 from app.models.template import TemplateVersion
 
+__all__ = [
+    "ExecutionPermission",
+    "RunAsMethod",
+    "Workflow",
+    "WorkflowHost",
+    "WorkflowRunAsBlock",
+    "WorkflowStep",
+    "WorkflowVariable",
+    "WorkflowVisibility",
+]
 
-class RunAsMethod(StrEnum):
-    """How the Run-As identity is authenticated to ``sudo``.
 
-    ``NOPASSWD`` sends no password at all and requires a sudoers rule; ``PASSWORD``
-    uses the Run-As target's own password, never the primary user's.
+class WorkflowVisibility(StrEnum):
+    """Who may see the workflow definition itself.
+
+    Mirrors ``TemplateVisibility``: ``PUBLIC`` widens *view* access to any
+    authenticated user, and never grants edit or execution rights.
     """
 
-    NOPASSWD = "nopasswd"
-    PASSWORD = "password"
+    PRIVATE = "private"
+    SHARED = "shared"
+    PUBLIC = "public"
+
+
+class ExecutionPermission(StrEnum):
+    """Who may start a run of this workflow.
+
+    Kept separate from visibility on purpose: publishing a workflow *definition*
+    must never let every user start SSH work against its hosts. A user who can
+    view but not execute still sees the definition and its history (subject to
+    log visibility), but ``POST /run`` is refused.
+    """
+
+    OWNER_ONLY = "owner_only"
+    SELECTED = "selected"
+    ALL_AUTHENTICATED = "all_authenticated"
 
 
 class Workflow(Base):
@@ -54,6 +80,21 @@ class Workflow(Base):
 
     credential_id: Mapped[int | None] = mapped_column(
         ForeignKey("ssh_credentials.id", ondelete="RESTRICT"), nullable=True
+    )
+
+    # Who may see this definition. Default PRIVATE so every existing workflow
+    # keeps exactly the isolation it had before visibility existed.
+    visibility: Mapped[WorkflowVisibility] = mapped_column(
+        enum_column(WorkflowVisibility, "workflow_visibility"),
+        nullable=False,
+        default=WorkflowVisibility.PRIVATE,
+    )
+    # Who may *start* it. Deliberately independent of ``visibility``: a public
+    # definition does not imply permission to run SSH work against its hosts.
+    execution_permission: Mapped[ExecutionPermission] = mapped_column(
+        enum_column(ExecutionPermission, "execution_permission"),
+        nullable=False,
+        default=ExecutionPermission.OWNER_ONLY,
     )
 
     # Scheduler wiring is stored now so enabling it later needs no migration.
@@ -155,10 +196,14 @@ class WorkflowRunAsBlock(Base):
 
 
 class WorkflowVariable(Base):
-    """A workflow-level variable discovered on each host before its steps run.
+    """A workflow-level variable, either discovered per host or user-defined.
 
-    The value is *never* stored here: it exists only inside one host's execution
-    context for the lifetime of that host workflow.
+    ``source`` is explicit rather than inferred from an empty command: a
+    user-defined variable legitimately has no discovery command, and a
+    command-backed one whose command happens to be blank must stay invalid. The
+    stored value for ``USER_DEFINED`` is *not* secret in the same sense as a
+    credential, but it is still never copied into execution history -- it is
+    resolved onto the execution's frozen discovery rows like any other.
     """
 
     __tablename__ = "workflow_variables"
@@ -172,7 +217,18 @@ class WorkflowVariable(Base):
     )
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    discovery_command: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[VariableSource] = mapped_column(
+        enum_column(VariableSource, "variable_source"),
+        nullable=False,
+        default=VariableSource.COMMAND_OUTPUT,
+    )
+    # Required for COMMAND_OUTPUT, must be empty for USER_DEFINED. Kept NOT NULL
+    # with a '' default so the existing column needs no rebuild and every legacy
+    # row stays valid.
+    discovery_command: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Only meaningful for USER_DEFINED. Not encrypted: it is workflow text the
+    # owner typed, equivalent to the script body next to it.
+    static_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
 
     workflow: Mapped[Workflow] = relationship(back_populates="variables")

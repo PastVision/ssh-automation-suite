@@ -28,21 +28,26 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.types import enum_column, timestamp_column
+from app.models.enums import RunAsMethod
 from app.models.step_rule import RuleColumns
 
 
 class TemplateVisibility(StrEnum):
     """Sharing intent, which governs whether grants may exist.
 
-    Access itself is decided by ``resource_permissions`` grants alone -- the read
-    path never consults this column. ``PRIVATE`` means "nobody but the owner", and
-    switching to it deletes every grant (and releases locks) so the column and the
-    grant table cannot disagree. ``SHARED`` means "the owner may grant access", and
-    a grant is required: there is deliberately no "everyone" level.
+    ``PRIVATE`` means "nobody but the owner", and switching to it deletes every
+    grant (and releases locks) so the column and the grant table cannot disagree.
+    ``SHARED`` means "the owner may grant access", and a grant is required.
+
+    ``PUBLIC`` means any *authenticated* user may view the resource. It is not an
+    anonymous/internet exposure: every route still requires a session. Public
+    grants viewing only -- never editing -- and never execution rights, which stay
+    governed by ``Workflow.execution_permission``.
     """
 
     PRIVATE = "private"
     SHARED = "shared"
+    PUBLIC = "public"
 
 
 class Template(Base):
@@ -173,6 +178,20 @@ class TemplateStep(Base, RuleColumns):
     script: Mapped[str] = mapped_column(Text, nullable=False)
     interpreter: Mapped[str] = mapped_column(String(40), nullable=False, default="bash")
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
+
+    # Per-step execution identity. NULL means "run as the SSH login user", which
+    # is the behaviour of every step written before this column existed. A
+    # non-NULL value overrides any workflow-level Run-As block governing this
+    # step, so one template can carry steps that run as different users.
+    #
+    # Only the *non-secret* target and method live here: a template version is an
+    # immutable, duplicated content snapshot, so a password must never be part of
+    # it. The password is resolved at run time from the workflow's Run-As
+    # credential map, keyed by target username.
+    run_as_username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    run_as_method: Mapped[RunAsMethod | None] = mapped_column(
+        enum_column(RunAsMethod, "run_as_method"), nullable=True
+    )
 
     version: Mapped[TemplateVersion] = relationship(back_populates="steps")
 

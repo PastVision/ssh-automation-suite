@@ -26,6 +26,7 @@ written during the replay is delivered exactly once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field
 
@@ -49,6 +50,23 @@ class LogFrame:
     start: int
     end: int
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class StatusEvent:
+    """Execution-level state change, fanned out on the same subscriptions.
+
+    Carried on the transcript channel because that is the only live channel an
+    open execution view already holds. It deliberately has no byte offsets: it is
+    a state notification, not transcript content, and must never be treated as
+    bytes to concatenate -- otherwise a status line would corrupt the log the
+    client is reassembling.
+    """
+
+    execution_id: int
+    status: str
+    reason: str | None = None
+    cancel_requested_at: str | None = None
 
 
 @dataclass
@@ -149,6 +167,40 @@ class LogBroadcaster:
                 len(subscribers),
             )
         return subscription
+
+    def publish_status(
+        self, execution_id: int, status: str, *, reason: str | None = None,
+        cancel_requested_at: str | None = None,
+    ) -> None:
+        """Tell every subscriber of this execution that its state changed.
+
+        Delivered to all hosts' subscriptions, because a client watching host 3
+        still needs to learn that the whole execution was cancelled. A status
+        event is never dropped for queue pressure -- it is small and it is the
+        last message a run produces, so losing it would leave a viewer waiting on
+        a run that is already over.
+        """
+        event = StatusEvent(
+            execution_id=execution_id,
+            status=status,
+            reason=reason,
+            cancel_requested_at=cancel_requested_at,
+        )
+        for (run_execution_id, _host_run_id), subscribers in list(self._subscribers.items()):
+            if run_execution_id != execution_id:
+                continue
+            for subscription in list(subscribers):
+                if subscription._closed:
+                    continue
+                try:
+                    subscription.queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    # Make room by discarding one stale chunk, which the client can
+                    # still read from the transcript file.
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        subscription.queue.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        subscription.queue.put_nowait(event)
 
     def unsubscribe(
         self, execution_id: int, host_run_id: int, subscription: _Subscription

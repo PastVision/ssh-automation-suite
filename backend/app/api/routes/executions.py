@@ -53,10 +53,16 @@ from app.services.identity import (
     require_same_origin,
     resolve_principal,
 )
-from app.services.log_broadcast import drain_dropped, get_broadcaster
+from app.services.log_broadcast import StatusEvent, drain_dropped, get_broadcaster
 from app.services.log_store import get_log_store
 
 logger = logging.getLogger(__name__)
+
+# A run in one of these states may still change and may be cancelled. Everything
+# else is final, so a cancel request against it is a no-op rather than a success.
+_NON_TERMINAL_STATUSES = frozenset(
+    {ExecutionStatus.PENDING, ExecutionStatus.RUNNING}
+)
 
 router = APIRouter(prefix="/executions", tags=["executions"])
 
@@ -258,6 +264,8 @@ def read_execution(
     request: Request,
     principal: sessions.Principal = Depends(require_principal),
 ) -> ExecutionRead:
+    from app.services.execution_runner import get_runner
+
     execution = _owned_execution(
         execution_id, principal, action="read", request=request
     )
@@ -278,6 +286,13 @@ def read_execution(
         created_at=execution.created_at,
         log_path=execution.log_path,
         error_message=execution.error_message,
+        cancel_requested_at=execution.cancel_requested_at,
+        cancel_requested_by_id=execution.cancel_requested_by_id,
+        cancel_reason=execution.cancel_reason,
+        is_active=(
+            execution.status in _NON_TERMINAL_STATUSES
+            and get_runner().is_active(execution.id)
+        ),
         hosts=[
             HostRunRead(
                 id=host.id,
@@ -324,20 +339,21 @@ def cancel_execution(
     # ownership check as reading.
     _owned_execution(execution_id, principal, action="cancel", request=request)
 
-    current = execution_state.execution_status(execution_id)
+    # Persist first, notify second. If the runner is never reached -- the task has
+    # already ended, or this process did not start the run -- the request is still
+    # in the database and therefore still visible in history, which is what makes
+    # a cancellation observable rather than a no-op.
+    recorded, current = execution_state.request_cancel(
+        execution_id,
+        reason="cancelled by request",
+        requested_by_id=principal.user_id,
+    )
     if current is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found")
-    if current in (
-        ExecutionStatus.SUCCEEDED,
-        ExecutionStatus.FAILED,
-        ExecutionStatus.CANCELLED,
-    ):
-        return CancelResponse(
-            id=execution_id, status=current, cancel_requested=False
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found"
         )
 
-    requested = get_runner().request_cancel(execution_id, "cancelled by request")
-    if requested:
+    if recorded:
         audit.record(
             AuditAction.EXECUTION_CANCELLED,
             actor_id=principal.user_id,
@@ -348,8 +364,27 @@ def cancel_execution(
             remote_addr=client_ip(request),
             detail={"status_at_request": current.value},
         )
+
+    # Cooperative signal to whichever host workflows are still alive. This does
+    # not kill a remote process; see ``CancelToken`` for what actually happens to
+    # an in-flight SSH command.
+    runner = get_runner()
+    signalled = runner.request_cancel(execution_id, "cancelled by request")
+
+    if recorded and not signalled and not runner.is_active(execution_id):
+        # Nothing in this process is running the row, so the cooperative signal
+        # reached nobody. Settle it here; otherwise it stays RUNNING for good and
+        # cannot be cancelled again because the request timestamp already exists.
+        execution_state.settle_unowned_cancel(
+            execution_id, reason="cancelled by request"
+        )
+        get_broadcaster().publish_status(
+            execution_id, ExecutionStatus.CANCELLED.value, reason="cancelled by request"
+        )
+        current = ExecutionStatus.CANCELLED
+
     return CancelResponse(
-        id=execution_id, status=current, cancel_requested=requested
+        id=execution_id, status=current, cancel_requested=recorded
     )
 
 
@@ -590,6 +625,19 @@ async def _forward_live(
             frame = None
 
         if frame is not None:
+            if isinstance(frame, StatusEvent):
+                # Not transcript bytes: no offsets, so it can never be trimmed or
+                # deduplicated against `sent`. Forwarded as-is, before the exit
+                # handling below decides whether the stream is finished.
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "status": frame.status,
+                        "reason": frame.reason,
+                        "cancel_requested_at": frame.cancel_requested_at,
+                    }
+                )
+                continue
             if frame.end <= sent:
                 # Produced during the replay read; already on the wire.
                 continue

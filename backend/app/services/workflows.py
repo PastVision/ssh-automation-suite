@@ -10,9 +10,15 @@ being patched per row. Reordering a unique ``(workflow_id, position)`` column in
 place would collide mid-update; replacing the set inside one transaction is both
 simpler and atomic, and it matches how a versioned template body already behaves.
 
-Authorization mirrors templates exactly: grants alone decide access, an
-unauthorized caller is told "not found", and a write needs both the edit lock and
-a current ``row_version``.
+Template references are *live*. A step stores ``template_id`` and is resolved to
+the template's current version at launch, so editing a template takes effect on
+the next run of every workflow that uses it without resaving the workflow. The
+execution then freezes that resolved version into its own snapshots, so a run
+already in flight is still immune to an edit. See ``build_execution_specs``.
+
+Authorization mirrors templates: owner, explicit grant, or public visibility
+decide *viewing*. Executing additionally requires ``execution_permission``, and
+writing still needs both the edit lock and a current ``row_version``.
 """
 
 from __future__ import annotations
@@ -30,16 +36,18 @@ from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.models.audit_actions import AuditAction
 from app.models.credential import SshCredential
-from app.models.enums import ExecutionStatus, ExecutionTrigger
+from app.models.enums import ExecutionStatus, ExecutionTrigger, VariableSource
 from app.models.permission import ResourcePermission, ResourceType
 from app.models.template import Template, TemplateVersion
 from app.models.workflow import (
+    ExecutionPermission,
     RunAsMethod,
     Workflow,
     WorkflowHost,
     WorkflowRunAsBlock,
     WorkflowStep,
     WorkflowVariable,
+    WorkflowVisibility,
 )
 from app.services import audit, execution_state, locks, permissions, run_as, variables
 from app.services.execution_runner import get_runner
@@ -106,6 +114,8 @@ class VariableData:
     discovery_command: str
     description: str | None = None
     timeout_seconds: int = 30
+    source: VariableSource = VariableSource.COMMAND_OUTPUT
+    static_value: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -140,6 +150,8 @@ class WorkflowBody:
     entries: tuple[Entry, ...] = ()
     variables: tuple[VariableData, ...] = ()
     hosts: tuple[HostData, ...] = ()
+    visibility: WorkflowVisibility = WorkflowVisibility.PRIVATE
+    execution_permission: ExecutionPermission = ExecutionPermission.OWNER_ONLY
 
 
 # --------------------------------------------------------------------------- #
@@ -185,18 +197,20 @@ def validate_body(body: WorkflowBody) -> None:
             raise WorkflowInvalid(f"Port {host.port} is out of range.")
 
     try:
-        variables.validate_unique([v.name for v in body.variables])
+        variables.validate_definitions(
+            [
+                variables.VariableDefinition(
+                    name=variable.name,
+                    source=variable.source,
+                    discovery_command=variable.discovery_command,
+                    static_value=variable.static_value,
+                    timeout_seconds=variable.timeout_seconds,
+                )
+                for variable in body.variables
+            ]
+        )
     except variables.RenderError as exc:
         raise WorkflowInvalid(str(exc)) from exc
-    for variable in body.variables:
-        if not (variable.discovery_command or "").strip():
-            raise WorkflowInvalid(
-                f"Variable {variable.name!r} needs a discovery command."
-            )
-        if not 1 <= variable.timeout_seconds <= 3600:
-            raise WorkflowInvalid(
-                f"Variable {variable.name!r} timeout must be between 1 and 3600 seconds."
-            )
 
 
 def _validate_run_as_blocks(entries: tuple[Entry, ...]) -> None:
@@ -236,11 +250,21 @@ def _validate_run_as_blocks(entries: tuple[Entry, ...]) -> None:
 
 
 def _visible_filter(user_id: int):
+    """Workflows ``user_id`` may list: own, explicitly shared, or public.
+
+    Public is included here and nowhere else, so the list a user sees is exactly
+    the set of workflows whose detail they may open. Without this an owner who
+    published a workflow would see it listed but get a 404 on open.
+    """
     shared_ids = select(ResourcePermission.resource_id).where(
         ResourcePermission.resource_type == RESOURCE,
         ResourcePermission.user_id == user_id,
     )
-    return or_(Workflow.owner_id == user_id, Workflow.id.in_(shared_ids))
+    return or_(
+        Workflow.owner_id == user_id,
+        Workflow.id.in_(shared_ids),
+        Workflow.visibility == WorkflowVisibility.PUBLIC,
+    )
 
 
 def _load(session: Session, workflow_id: int) -> Workflow:
@@ -265,7 +289,13 @@ def get(workflow_id: int, principal: Principal) -> Workflow:
     session = get_session_factory()()
     try:
         workflow = _load(session, workflow_id)
-        if not permissions.can_view(RESOURCE, workflow.id, workflow.owner_id, principal.user_id):
+        if not permissions.can_view(
+            RESOURCE,
+            workflow.id,
+            workflow.owner_id,
+            principal.user_id,
+            visibility=workflow.visibility,
+        ):
             raise WorkflowNotFound(workflow_id)
         return workflow
     finally:
@@ -274,6 +304,21 @@ def get(workflow_id: int, principal: Principal) -> Workflow:
 
 def can_edit(workflow: Workflow, principal: Principal) -> bool:
     return permissions.can_edit(RESOURCE, workflow.id, workflow.owner_id, principal.user_id)
+
+
+def can_run(workflow: Workflow, principal: Principal) -> bool:
+    """Whether this caller may start a run.
+
+    Deliberately separate from ``can_edit``: a shared editor may change the
+    definition, and only ``execution_permission`` decides who may make SSH
+    connections with it.
+    """
+    return permissions.can_run_workflow(
+        workflow_id=workflow.id,
+        owner_id=workflow.owner_id,
+        user_id=principal.user_id,
+        execution_permission=workflow.execution_permission,
+    )
 
 
 def is_owner(workflow: Workflow, principal: Principal) -> bool:
@@ -677,18 +722,56 @@ def _release_all_locks(workflow_id: int) -> int:
         session.close()
 
 
+def _current_versions(
+    session: Session, template_ids: set[int]
+) -> dict[int, TemplateVersion]:
+    """The newest version of each template, with its steps loaded.
+
+    ``WorkflowStep.template_version_id`` records the version that existed when the
+    workflow was last saved, and is kept only as a *reference* to the template
+    itself. Executing from it made an edited template silently keep running its old
+    body until someone re-saved every workflow that used it. Resolving to the
+    newest version here makes an edit take effect on the next run, which is what a
+    user means by "editing a template".
+
+    Safety is preserved by the second half of the story, not by staleness: the
+    execution immediately freezes whatever this returns into its own
+    ``execution_template_snapshots`` rows, so a run that is already in flight is
+    still immune to a later edit.
+    """
+    if not template_ids:
+        return {}
+    rows = session.scalars(
+        select(TemplateVersion)
+        .where(TemplateVersion.template_id.in_(template_ids))
+        .options(selectinload(TemplateVersion.steps))
+        .order_by(TemplateVersion.template_id, TemplateVersion.version)
+    ).all()
+    newest: dict[int, TemplateVersion] = {}
+    for row in rows:
+        # Ordered ascending, so the last row per template is the newest and no
+        # second comparison (or a MAX() subquery) is needed.
+        newest[row.template_id] = row
+    return newest
+
+
 def build_execution_specs(
     workflow: Workflow, *, hostnames: list[str] | None = None
 ) -> tuple[list[StepSpec], list[HostSpec], list[VariableSpec]]:
     """Freeze a workflow into the specs an execution needs.
 
-    Run-As is resolved here, at launch: each template step is attributed the
-    target of the *most recent preceding* block, or the primary user when no block
-    precedes it. The block's ``position`` is carried onto the step so history can
-    group the children under the transition that produced them.
+    Two independent resolutions happen here, both at launch rather than at save:
 
-    Nested blocks are impossible by construction (one flat position space), so the
-    attribution is a single forward pass.
+    *Template content* -- each step is re-read from its template's newest version
+    (see ``_current_versions``), so a template edited after the workflow was saved
+    runs its new body on the next execution.
+
+    *Run-As* -- a step's own ``run_as_username`` wins when set; otherwise it
+    inherits the target of the most recent preceding workflow block; otherwise it
+    runs as the SSH login user. The block's ``position`` is carried onto the step
+    so history can group children under the transition that produced them. Nested
+    blocks are impossible by construction (one flat position space), so this is a
+    single forward pass.
     """
     from app.services.execution_state import HostSpec, StepSpec, VariableSpec
 
@@ -710,36 +793,60 @@ def build_execution_specs(
         credential_username = credential.username
         default_port = credential.default_port
         credential_id = credential.id
+
+        template_ids = {
+            entry.template_version.template_id
+            for entry in workflow.steps
+            if entry.template_version is not None
+        }
+        current_versions = _current_versions(session, template_ids)
     finally:
         session.close()
 
     steps: list[StepSpec] = []
-    run_as_target: str | None = None
-    run_as_method = None
-    run_as_position: int | None = None
+    block_target: str | None = None
+    block_method: RunAsMethod | None = None
+    block_position: int | None = None
 
     for entry in ordered_entries(workflow):
         if isinstance(entry, WorkflowRunAsBlock):
-            run_as_target = entry.target_username
-            run_as_method = entry.method
-            run_as_position = entry.position
+            block_target = entry.target_username
+            block_method = entry.method
+            block_position = entry.position
             continue
 
-        version = entry.template_version
-        if version is None:
+        pinned = entry.template_version
+        if pinned is None:
             raise WorkflowInvalid(
-                f"Workflow step {entry.position} has no pinned template version."
+                f"Workflow step {entry.position} has no template reference."
+            )
+        version = current_versions.get(pinned.template_id, pinned)
+        if version is None:  # pragma: no cover - defensive, template_id is NOT NULL
+            raise WorkflowInvalid(
+                f"Workflow step {entry.position} has no template version to run."
             )
         # A template version holds several shell steps, and they all run in the
-        # pinned order inside the workflow's own position. Flattening here keeps
+        # version's own order inside the workflow's position. Flattening here keeps
         # the engine's unit of work a single script, which is what it has always
         # executed and what the execution history records.
         version_steps = sorted(version.steps, key=lambda s: s.position)
         if not version_steps:
-            raise WorkflowInvalid(
-                f"Template {version.name!r} has no steps to run."
-            )
+            raise WorkflowInvalid(f"Template {version.name!r} has no steps to run.")
         for version_step in version_steps:
+            # A step-level identity overrides the enclosing block. Inheriting
+            # ``block_position`` even when overridden keeps history anchored to the
+            # transition that introduced the context; a step with its own identity
+            # and no enclosing block gets no position, because no transition (and
+            # therefore no sudo password) is involved.
+            step_target = version_step.run_as_username or block_target
+            if version_step.run_as_username:
+                step_method = version_step.run_as_method
+                step_position = (
+                    block_position if version_step.run_as_method is None else None
+                )
+            else:
+                step_method = block_method
+                step_position = block_position
             steps.append(
                 StepSpec(
                     template_name=version.name,
@@ -750,9 +857,9 @@ def build_execution_specs(
                     template_id=version.template_id,
                     template_version_id=version.id,
                     rule=version_step.to_rule(),
-                    run_as_username=run_as_target,
-                    run_as_method=run_as_method,
-                    run_as_position=run_as_position,
+                    run_as_username=step_target,
+                    run_as_method=step_method,
+                    run_as_position=step_position,
                 )
             )
 
@@ -778,6 +885,8 @@ def build_execution_specs(
             name=variable.name,
             discovery_command=variable.discovery_command,
             timeout_seconds=variable.timeout_seconds,
+            source=variable.source,
+            static_value=variable.static_value,
         )
         for variable in workflow.variables
     ]

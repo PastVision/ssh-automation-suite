@@ -91,6 +91,13 @@ class ExecutionRead(BaseModel):
     created_at: datetime | None = None
     log_path: str | None = None
     error_message: str | None = None
+    cancel_requested_at: datetime | None = None
+    cancel_requested_by_id: int | None = None
+    cancel_reason: str | None = None
+    # True while the run is non-terminal and this service is actively executing it.
+    # Distinguishes "cancel is still possible" from a row left non-terminal after a
+    # restart, where only the owner's intervention can end it.
+    is_active: bool = False
     hosts: list[HostRunRead] = Field(default_factory=list)
 
 

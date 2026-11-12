@@ -37,14 +37,16 @@ from app.models.enums import (
     ExecutionStatus,
     ExecutionTrigger,
     HostRunStatus,
+    LogVisibility,
     MatchOperator,
     OutputStream,
+    RunAsMethod,
     StepAction,
     StepDecision,
     StepRunStatus,
+    VariableSource,
 )
 from app.models.step_rule import RuleColumns
-from app.models.workflow import RunAsMethod
 
 
 class Execution(Base):
@@ -113,6 +115,26 @@ class Execution(Base):
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = timestamp_column()
+
+    # -- cancellation ------------------------------------------------------- #
+    # Who asked to stop this run and when. Recorded even if the run finished
+    # first, so "cancel raced completion" is visible in history rather than
+    # looking like a cancellation that silently did nothing.
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    cancel_requested_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    cancel_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    # -- log visibility ----------------------------------------------------- #
+    # Governs transcripts and step output only. Defaults to the workflow owner's
+    # privacy, so no historical run becomes readable just because this column
+    # was introduced.
+    log_visibility: Mapped[LogVisibility] = mapped_column(
+        enum_column(LogVisibility, "log_visibility"),
+        nullable=False,
+        default=LogVisibility.PRIVATE,
+    )
 
     # Root directory of this run's transcripts, relative to the backend directory.
     log_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -316,8 +338,18 @@ class ExecutionVariableDiscovery(Base):
     )
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     # Frozen at execution creation, so a mid-run edit cannot change the command.
-    discovery_command: Mapped[str] = mapped_column(Text, nullable=False)
+    # Empty for a user-defined variable, whose value is frozen in ``static_value``.
+    discovery_command: Mapped[str] = mapped_column(Text, nullable=False, default="")
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    # Frozen source, so history explains *why* there is (or is not) a command.
+    source: Mapped[VariableSource] = mapped_column(
+        enum_column(VariableSource, "variable_source"),
+        nullable=False,
+        default=VariableSource.COMMAND_OUTPUT,
+    )
+    # A user-defined value, copied here so an in-flight run is immune to an edit.
+    # Never a discovery result: those are recorded as metadata only.
+    static_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[StepRunStatus] = mapped_column(
         enum_column(StepRunStatus, "step_run_status"),

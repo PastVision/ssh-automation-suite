@@ -748,15 +748,26 @@ def test_declared_server_defaults_are_created_by_the_migration(
 def test_undeclared_server_defaults_are_known(migrated_template_db: Path) -> None:
     """Database-only defaults are pinned, so a new one is a deliberate change.
 
-    Three columns carry a default that the ORM does not declare. They are needed
-    because SQLite cannot add a NOT NULL column to a populated table without one,
-    and they remain useful as a safety net for raw inserts. Pinning the exact set
-    means a future migration cannot quietly introduce another.
+    Each column here carries a default that the ORM does not declare. They are
+    needed because SQLite cannot add a NOT NULL column to a populated table
+    without one, and they remain useful as a safety net for raw inserts. Pinning
+    the exact set means a future migration cannot quietly introduce another.
+
+    The post-1.0.0 remediation migration adds five, one per newly non-null column:
+    ``workflow_variables.source`` and ``execution_variable_discoveries.source``
+    (command_output is the pre-existing behaviour), ``workflows.visibility`` and
+    ``executions.log_visibility`` (private), and
+    ``workflows.execution_permission`` (owner_only).
     """
     assert migration_support.undeclared_server_defaults(migrated_template_db) == {
         "templates.row_version",
         "templates.visibility",
         "workflows.row_version",
+        "workflows.visibility",
+        "workflows.execution_permission",
+        "executions.log_visibility",
+        "workflow_variables.source",
+        "execution_variable_discoveries.source",
     }
 
 

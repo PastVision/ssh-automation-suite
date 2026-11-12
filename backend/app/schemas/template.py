@@ -22,10 +22,12 @@ from app.models.enums import (
     ConditionLocation,
     MatchOperator,
     OutputStream,
+    RunAsMethod,
     StepAction,
 )
 from app.models.template import TemplateVisibility
 from app.schemas.locks import LockRead
+from app.services import run_as
 
 
 class StepConditionInput(BaseModel):
@@ -98,6 +100,36 @@ class TemplateStepInput(BaseModel):
     interpreter: str = Field(default="bash", max_length=40)
     timeout_seconds: int = Field(default=300, ge=1, le=86400)
     rule: StepRuleInput = Field(default_factory=StepRuleInput)
+    # Per-step execution identity. Omitted/empty means the SSH login user. The
+    # password is deliberately *not* here: a template version is immutable content
+    # that gets copied into history, so it must never carry a secret. Password-mode
+    # steps resolve their password from the workflow's Run-As credentials.
+    run_as_username: str | None = Field(default=None, max_length=32)
+    run_as_method: RunAsMethod | None = None
+
+    @field_validator("run_as_username")
+    @classmethod
+    def _run_as_username_is_a_unix_account(cls, value: str | None) -> str | None:
+        """Validate here as well as in the service, for a precise 422."""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            run_as.validate_target(cleaned)
+        except run_as.RunAsError as exc:
+            raise ValueError(str(exc)) from exc
+        return cleaned
+
+    @model_validator(mode="after")
+    def _run_as_method_requires_a_target(self) -> TemplateStepInput:
+        if self.run_as_method is not None and not self.run_as_username:
+            raise ValueError(
+                "run_as_method requires run_as_username; omit both to run as the "
+                "SSH login user"
+            )
+        return self
 
     @field_validator("interpreter")
     @classmethod
@@ -143,6 +175,8 @@ class TemplateStepRead(BaseModel):
     interpreter: str
     timeout_seconds: int
     rule: StepRuleRead = Field(default_factory=lambda: StepRuleRead(action=StepAction.CONTINUE))
+    run_as_username: str | None = None
+    run_as_method: RunAsMethod | None = None
 
 
 class TemplateVersionRead(BaseModel):

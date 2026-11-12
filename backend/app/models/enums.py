@@ -18,6 +18,45 @@ class ExecutionStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class VariableSource(StrEnum):
+    """Where a workflow variable's value comes from.
+
+    Explicit rather than inferred: a user-defined variable has no discovery
+    command at all, and "empty command" must not silently mean "static" for a
+    command-backed variable that was left blank by mistake.
+    """
+
+    COMMAND_OUTPUT = "command_output"
+    USER_DEFINED = "user_defined"
+
+
+class LogVisibility(StrEnum):
+    """Who may read an execution's transcripts.
+
+    Independent of the workflow's visibility: publishing a workflow must not
+    silently publish the output of runs that already happened.
+    """
+
+    PRIVATE = "private"
+    SHARED = "shared"
+    PUBLIC = "public"
+
+
+class RunAsMethod(StrEnum):
+    """How a Run-As identity is authenticated to ``sudo``.
+
+    ``NOPASSWD`` sends no password at all and requires a sudoers rule; ``PASSWORD``
+    uses the invoking user's sudo password, which is what ``sudo -u`` verifies.
+
+    Lives here rather than next to the workflow model because both
+    ``WorkflowRunAsBlock`` and ``TemplateStep`` reference it, and ``template`` must
+    not import ``workflow`` (that would be a cycle).
+    """
+
+    NOPASSWD = "nopasswd"
+    PASSWORD = "password"
+
+
 class HostRunStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"

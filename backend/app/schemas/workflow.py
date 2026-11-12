@@ -18,7 +18,12 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.workflow import RunAsMethod
+from app.models.enums import VariableSource
+from app.models.workflow import (
+    ExecutionPermission,
+    RunAsMethod,
+    WorkflowVisibility,
+)
 
 
 class HostInput(BaseModel):
@@ -34,8 +39,18 @@ class HostRead(BaseModel):
 
 
 class VariableInput(BaseModel):
+    """One variable definition.
+
+    ``source`` is required in spirit but defaults to ``command_output`` so every
+    existing client that only knows about discovery commands keeps working. The
+    source-specific requirement is enforced in ``app.services.variables``, which
+    is also what the executor and the tests use, so there is exactly one rule.
+    """
+
     name: str = Field(min_length=1, max_length=64)
-    discovery_command: str = Field(min_length=1, max_length=8000)
+    source: VariableSource = VariableSource.COMMAND_OUTPUT
+    discovery_command: str = Field(default="", max_length=8000)
+    static_value: str | None = Field(default=None, max_length=8192)
     description: str | None = Field(default=None, max_length=500)
     timeout_seconds: int = Field(default=30, ge=1, le=3600)
 
@@ -44,7 +59,9 @@ class VariableRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     name: str
+    source: VariableSource
     discovery_command: str
+    static_value: str | None
     description: str | None
     timeout_seconds: int
 
@@ -92,6 +109,9 @@ class WorkflowCreate(BaseModel):
     entries: list[EntryInput] = Field(default_factory=list)
     variables: list[VariableInput] = Field(default_factory=list)
     hosts: list[HostInput] = Field(default_factory=list)
+    # Omitted means the secure default: private, owner-only execution.
+    visibility: WorkflowVisibility = WorkflowVisibility.PRIVATE
+    execution_permission: ExecutionPermission = ExecutionPermission.OWNER_ONLY
 
 
 class WorkflowUpdate(BaseModel):
@@ -101,6 +121,10 @@ class WorkflowUpdate(BaseModel):
     entries: list[EntryInput] = Field(default_factory=list)
     variables: list[VariableInput] = Field(default_factory=list)
     hosts: list[HostInput] = Field(default_factory=list)
+    # Omitted means "leave unchanged", so a client that predates visibility cannot
+    # accidentally make an existing workflow public by saving it.
+    visibility: WorkflowVisibility | None = None
+    execution_permission: ExecutionPermission | None = None
     # Optimistic concurrency. Optional so a first save from a stale form still
     # gets the lock check rather than a silent overwrite.
     row_version: int | None = None
@@ -114,10 +138,18 @@ class WorkflowSummary(BaseModel):
     row_version: int
     can_edit: bool
     is_owner: bool
+    can_run: bool
+    visibility: WorkflowVisibility
+    execution_permission: ExecutionPermission
     step_count: int
     run_as_count: int
     variable_count: int
     host_count: int
+    # How many executions of this workflow are running right now. Computed from
+    # the live runner rather than from the database, so a run that crashed and was
+    # reconciled cannot leave a permanent "running" badge.
+    active_execution_count: int = 0
+    last_run_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -131,6 +163,9 @@ class WorkflowDetail(BaseModel):
     row_version: int
     can_edit: bool
     is_owner: bool
+    can_run: bool
+    visibility: WorkflowVisibility
+    execution_permission: ExecutionPermission
     entries: list[EntryRead]
     variables: list[VariableRead]
     hosts: list[HostRead]

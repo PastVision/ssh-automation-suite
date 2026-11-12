@@ -33,7 +33,14 @@ from app.models.enums import (
     StepRunStatus,
 )
 from app.models.workflow import RunAsMethod
-from app.services import conditions, execution_state, run_as, ssh_transport, variables
+from app.services import (
+    conditions,
+    execution_state,
+    run_as,
+    ssh_transport,
+    sudo,
+    variables,
+)
 from app.services.concurrency import HostWorkflowLimiter, get_limiter
 from app.services.execution_log import HostTranscript
 from app.services.execution_state import HostSpec, StepSpec, VariableSpec
@@ -114,6 +121,18 @@ class ExecutionRunner:
         # credential outlives the run in memory.
         self._variable_specs: dict[int, list[VariableSpec]] = {}
         self._run_as_passwords: dict[int, dict[int, str]] = {}
+        # Per-execution primary sudo passwords, keyed by credential id, plus the
+        # set of credentials already looked up (so "not configured" is cached too).
+        # Scoped to the execution like the Run-As passwords above so one run's
+        # secret cannot outlive it, and so a second run sharing a credential
+        # re-reads rather than inheriting.
+        self._sudo_passwords: dict[int, dict[int, str]] = {}
+        self._sudo_password_loaded: dict[int, set[int]] = {}
+        # Whether `sudo -n true` succeeded, keyed by (execution id, host run id).
+        # Per host, not per credential: two hosts can share a credential and still
+        # have different sudoers. The execution id keeps the cache bounded to the
+        # run that created it.
+        self._sudo_nopasswd: dict[tuple[int, int], bool] = {}
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -130,6 +149,21 @@ class ExecutionRunner:
             return False
         token.cancel(reason)
         return True
+
+    def is_active(self, execution_id: int) -> bool:
+        """Whether this process is currently running the execution."""
+        return execution_id in self._tasks
+
+    def _broadcast_status(
+        self, execution_id: int, status: str, *, reason: str | None = None
+    ) -> None:
+        """Push a state change to viewers. Best-effort: never breaks a run."""
+        try:
+            get_broadcaster().publish_status(
+                execution_id, status, reason=reason
+            )
+        except Exception:  # pragma: no cover - publisher is in-process and benign
+            logger.exception("Could not broadcast status for execution %s", execution_id)
 
     def start(self, execution_id: int) -> asyncio.Task[None]:
         """Schedule an execution. Raises if shutting down."""
@@ -153,6 +187,10 @@ class ExecutionRunner:
         # them cached would leave a secret in memory for the life of the process.
         self._variable_specs.pop(execution_id, None)
         self._run_as_passwords.pop(execution_id, None)
+        self._sudo_passwords.pop(execution_id, None)
+        self._sudo_password_loaded.pop(execution_id, None)
+        for key in [key for key in self._sudo_nopasswd if key[0] == execution_id]:
+            self._sudo_nopasswd.pop(key, None)
 
     async def shutdown(self, grace_seconds: float | None = None) -> None:
         """Stop accepting work, let host workflows finish, then cancel.
@@ -250,6 +288,13 @@ class ExecutionRunner:
                 execution_id,
                 status=status,
                 error_message=token.reason if status is ExecutionStatus.CANCELLED else None,
+            )
+            # Told last, after the final state is durable: a viewer that reloads on
+            # this signal must not still read RUNNING.
+            self._broadcast_status(
+                execution_id,
+                status.value,
+                reason=token.reason if status is ExecutionStatus.CANCELLED else None,
             )
             logger.info("Execution %s finished: %s", execution_id, status.value)
         except Exception:
@@ -421,7 +466,7 @@ class ExecutionRunner:
                     continue
                 outcome = await self._run_step(
                     execution_id, host_run_id, step, position, conn, token,
-                    transcript, values,
+                    transcript, values, spec,
                 )
                 if not outcome.ok:
                     return  # step failed or was cancelled; host already settled
@@ -548,7 +593,7 @@ class ExecutionRunner:
 
         return values
 
-    def _step_transport(
+    async def _step_transport(
         self,
         execution_id: int,
         host_run_id: int,
@@ -556,6 +601,9 @@ class ExecutionRunner:
         position: int,
         script: str,
         transcript: HostTranscript,
+        spec: HostSpec,
+        conn,
+        token: CancelToken,
     ) -> tuple[str, str | None] | None:
         """Return ``(command, stdin_data)`` for one step, or None on failure.
 
@@ -566,11 +614,15 @@ class ExecutionRunner:
         instead of the script. That is why the two paths differ: only one of them
         may use stdin for the program text.
 
-        A non-None return of ``None`` means the transition was attempted and
-        failed; the host has already been settled and the caller must stop.
+        A ``None`` return means the step cannot be transported and the host has
+        already been settled; the caller must stop. The reason is on the
+        transcript, which is where the operator will read it.
         """
         if not step.run_as_username:
-            return _script_command(step), script
+            return await self._plain_transport(
+                execution_id, host_run_id, step, position, script, transcript,
+                spec, conn, token
+            )
 
         method = step.run_as_method or RunAsMethod.NOPASSWD
         password = None
@@ -587,17 +639,10 @@ class ExecutionRunner:
             run_as.validate_password(context.password, context.method)
             command = run_as.wrap_script(context, step.interpreter, script)
         except run_as.RunAsError as exc:
-            message = f"Run-As to {step.run_as_username!r} is not usable: {exc}"
-            transcript.note(message)
-            if step.run_as_position is not None:
-                execution_state.record_transition(
-                    host_run_id,
-                    step.run_as_position,
-                    status=StepRunStatus.FAILED,
-                    detail=message,
-                )
-            self._fail_host(host_run_id, transcript, message, failed_step=position)
-            return None
+            return self._abort_transport(
+                host_run_id, step, position, transcript,
+                f"Run-As to {step.run_as_username!r} is not usable: {exc}",
+            )
 
         if step.run_as_position is not None:
             execution_state.record_transition(
@@ -636,9 +681,167 @@ class ExecutionRunner:
             detail=detail,
         )
 
-    @staticmethod
+    async def _plain_transport(
+        self,
+        execution_id: int,
+        host_run_id: int,
+        step: StepSpec,
+        position: int,
+        script: str,
+        transcript: HostTranscript,
+        spec: HostSpec,
+        conn,
+        token: CancelToken,
+    ) -> tuple[str, str | None] | None:
+        """Transport for a step that runs as the primary SSH user.
+
+        Three shapes, chosen by what this host and script actually need:
+
+        * **No sudo that could prompt** -- unchanged behaviour. The interpreter
+          reads the program from stdin (``bash -s``), exactly as before.
+        * **Passwordless sudo** -- proven by probing ``sudo -n true`` once per
+          host. Also unchanged, so ``NOPASSWD`` hosts keep their original stdin
+          and need no password at all.
+        * **Password-based sudo** -- stdin becomes sudo's password channel, so the
+          program travels in the command line (``-c '...'``) and the sudo calls
+          are rewritten to ``-S``. With no password configured the step fails with
+          the specified warning instead of the terminal-required error.
+        """
+        analysis = sudo.analyze(script)
+        if not analysis.requires_password:
+            return _script_command(step), script
+
+        program = (step.interpreter or "bash").strip() or "bash"
+
+        # Ask sudo itself rather than guessing from the script text: NOPASSWD
+        # rules, `sudo -n`, and a cached credential all make "requires a
+        # password" untrue, and proceeding as if they did would break hosts that
+        # work today.
+        if await self._passwordless_sudo(
+            execution_id, host_run_id, conn, spec, token, transcript
+        ):
+            return _script_command(step), script
+
+        password = self._sudo_password(execution_id, spec.credential_id)
+        if password is None:
+            return self._abort_transport(
+                host_run_id, step, position, transcript,
+                sudo.missing_password_warning(spec.hostname),
+            )
+
+        conflict = sudo.stdin_consumer(script)
+        if conflict:
+            return self._abort_transport(
+                host_run_id, step, position, transcript,
+                f"{spec.hostname}: this template runs sudo with a password and "
+                f"also reads standard input (`{conflict}`). Both need the same "
+                "channel, so the password cannot be delivered. Configure "
+                "passwordless sudo for this account, or remove the standard-input "
+                "read.",
+            )
+
+        # ``-c`` frees stdin for the password. The rewritten script is quoted so
+        # the remote shell sees it as one argument, preserving every quote,
+        # newline, ``$`` and pipeline exactly as authored.
+        #
+        # One line per sudo invocation: sudo's credential cache usually means
+        # only the first one reads it, but a host with timestamps disabled reads
+        # every time. Supplying exactly as many lines as there are invocations
+        # covers both, because an unread line is simply never consumed.
+        lines = max(1, sudo.sudo_invocation_count(script))
+        return (
+            f"{program} -c {_shell_single_quote(sudo.rewrite(script))}",
+            f"{password}\n" * lines,
+        )
+
+    def _abort_transport(
+        self,
+        host_run_id: int,
+        step: StepSpec,
+        position: int,
+        transcript: HostTranscript,
+        message: str,
+    ) -> None:
+        """Fail a step that cannot be transported, and settle its rows.
+
+        Without this the host stays ``RUNNING`` forever: the transport decides
+        before any command is sent, so nothing later in the step path settles it.
+        """
+        transcript.note(message)
+        if step.run_as_position is not None:
+            execution_state.record_transition(
+                host_run_id,
+                step.run_as_position,
+                status=StepRunStatus.FAILED,
+                detail=message,
+            )
+        self._fail_host(host_run_id, transcript, message, failed_step=position)
+
+    async def _passwordless_sudo(
+        self,
+        execution_id: int,
+        host_run_id: int,
+        conn,
+        spec: HostSpec,
+        token: CancelToken,
+        transcript: HostTranscript,
+    ) -> bool:
+        """Whether ``sudo`` works here without a password. Cached per host run.
+
+        One probe per host rather than per step: the answer cannot change during
+        a run, and a probe per step would add a command to every sudo template.
+        ``-n`` is deliberate -- it makes sudo fail immediately instead of waiting
+        for input that will never come.
+        """
+        key = (execution_id, host_run_id)
+        if key in self._sudo_nopasswd:
+            return self._sudo_nopasswd[key]
+        try:
+            result = await ssh_transport.run_command(
+                conn,
+                "sudo -n true",
+                timeout=self.settings.ssh_command_timeout_seconds,
+                cancel_event=token.event,
+            )
+            allowed = result.exit_code == 0
+        except Exception:
+            # A probe failure is not a verdict on sudo; fall through to the
+            # configured-password path so a transient error cannot silently
+            # skip authentication entirely.
+            logger.exception("sudo -n probe failed for %s", spec.hostname)
+            return False
+        self._sudo_nopasswd[key] = allowed
+        if allowed:
+            transcript.note(
+                f"{spec.hostname}: sudo is available without a password "
+                "(NOPASSWD); leaving sudo commands unchanged."
+            )
+        return allowed
+
+    def _sudo_password(self, execution_id: int, credential_id: int) -> str | None:
+        """The primary sudo password for a credential, decrypted once per run.
+
+        ``None`` means "not configured", which is a normal state for passwordless
+        hosts. The loaded set distinguishes that from "not looked up yet", so an
+        unset password is not re-queried on every step of the same run.
+        """
+        loaded = self._sudo_password_loaded.setdefault(execution_id, set())
+        if credential_id in loaded:
+            return self._sudo_passwords.get(execution_id, {}).get(credential_id)
+        loaded.add(credential_id)
+        try:
+            password = execution_state.load_primary_sudo_password(credential_id)
+        except Exception:
+            logger.exception(
+                "Could not load the sudo password for credential %s", credential_id
+            )
+            return None
+        if password is not None:
+            self._sudo_passwords.setdefault(execution_id, {})[credential_id] = password
+        return password
+
     def _transition_detail(
-        step: StepSpec, exit_code: int | None, result, failed: bool
+        self, step: StepSpec, exit_code: int | None, result, failed: bool
     ) -> str:
         """Explain a Run-As failure without blaming the child script for it.
 
@@ -676,6 +879,7 @@ class ExecutionRunner:
         token: CancelToken,
         transcript: HostTranscript,
         values: dict[str, str] | None = None,
+        spec: HostSpec | None = None,
     ) -> _StepOutcome:
         """Run one step and return its outcome to the caller.
 
@@ -707,11 +911,18 @@ class ExecutionRunner:
             self._fail_host(host_run_id, transcript, message, failed_step=position)
             return _StepOutcome(failure=message)
 
-        transport = self._step_transport(
-            execution_id, host_run_id, step, position, rendered.text, transcript
+        transport = await self._step_transport(
+            execution_id, host_run_id, step, position, rendered.text, transcript,
+            spec or HostSpec(
+                hostname="this host", port=22, credential_id=-1, credential_name=""
+            ),
+            conn,
+            token,
         )
         if transport is None:
-            return _StepOutcome(failure="Run-As transition failed")
+            # The transport already failed and settled this host; a second
+            # failure here would overwrite its own message.
+            return _StepOutcome(failure="the step could not be transported")
         command, stdin_data = transport
 
         try:
@@ -1101,6 +1312,16 @@ def _script_command(step: StepSpec) -> str:
     """
     interpreter = (step.interpreter or "bash").strip() or "bash"
     return f"{interpreter} -s"
+
+
+def _shell_single_quote(value: str) -> str:
+    """Quote ``value`` as one POSIX shell word.
+
+    Single quotes suppress every expansion, so the script reaches the remote
+    interpreter byte-for-byte. An embedded single quote is closed, escaped and
+    reopened, which is the only sequence a single-quoted string cannot contain.
+    """
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 RUNNER_SINGLETON: ExecutionRunner | None = None

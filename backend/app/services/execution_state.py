@@ -28,6 +28,7 @@ from app.models.enums import (
     HostRunStatus,
     StepDecision,
     StepRunStatus,
+    VariableSource,
 )
 from app.models.execution import (
     Execution,
@@ -77,11 +78,18 @@ class StepSpec:
 
 @dataclass(frozen=True)
 class VariableSpec:
-    """A workflow variable discovery command frozen into the execution."""
+    """One variable frozen into the execution.
+
+    ``static_value`` is set only for a user-defined variable, and then
+    ``discovery_command`` is empty. The runner branches on ``source``, never on
+    which string happens to be blank.
+    """
 
     name: str
     discovery_command: str
     timeout_seconds: int
+    source: VariableSource = VariableSource.COMMAND_OUTPUT
+    static_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +214,8 @@ def create_execution(
                         name=variable.name,
                         discovery_command=variable.discovery_command,
                         timeout_seconds=variable.timeout_seconds,
+                        source=variable.source,
+                        static_value=variable.static_value,
                         position=variable_position,
                         status=StepRunStatus.PENDING,
                     )
@@ -381,6 +391,8 @@ def load_variable_specs(execution_id: int) -> list[VariableSpec]:
                     name=row.name,
                     discovery_command=row.discovery_command,
                     timeout_seconds=row.timeout_seconds,
+                    source=row.source,
+                    static_value=row.static_value,
                 ),
             )
         return list(seen.values())
@@ -495,6 +507,35 @@ def get_execution(execution_id: int) -> Execution | None:
                 selectinload(Execution.snapshots),
             )
         ).first()
+    finally:
+        session.close()
+
+
+def active_counts_by_workflow() -> dict[int, int]:
+    """Non-terminal execution count per workflow.
+
+    Read from the database, not from the runner's in-memory task set, because the
+    Workflows page must be correct after a refresh and after a restart this process
+    may not have observed. ``reconcile_abandoned_executions`` is what keeps that
+    trustworthiness: a row abandoned by a dead process is settled rather than left
+    inflating this count forever.
+
+    One grouped query for the whole list page, so rendering badges cannot turn into
+    N+1 round trips.
+    """
+    session = _session()
+    try:
+        rows = session.execute(
+            select(Execution.workflow_id, func.count(Execution.id))
+            .where(
+                Execution.workflow_id.is_not(None),
+                Execution.status.in_(
+                    [ExecutionStatus.PENDING, ExecutionStatus.RUNNING]
+                ),
+            )
+            .group_by(Execution.workflow_id)
+        ).all()
+        return {workflow_id: count for workflow_id, count in rows}
     finally:
         session.close()
 
@@ -617,10 +658,13 @@ def finish_host(
     failed_step_position: int | None = None,
     cancelled_steps: bool = False,
 ) -> None:
-    """Finalise a host row and any of its steps still pending.
+    """Finalise a host row and any of its steps still open.
 
-    Pending steps are marked SKIPPED (fail-fast) or CANCELLED (interrupted) so no
-    step row is left claiming to be PENDING after its host has finished.
+    Unfinished steps are marked SKIPPED (fail-fast) or CANCELLED (interrupted) so
+    no step row is left claiming to be PENDING or RUNNING after its host has
+    finished. The step named by ``failed_step_position`` is the one that failed,
+    so it is recorded as FAILED rather than skipped: reporting it as skipped would
+    hide which step actually broke.
     """
     with _write_session() as session:
         host_run = session.get(ExecutionHostRun, host_run_id)
@@ -632,9 +676,13 @@ def finish_host(
         host_run.finished_at = utcnow()
         terminal = StepRunStatus.CANCELLED if cancelled_steps else StepRunStatus.SKIPPED
         for step_run in host_run.step_runs:
-            if step_run.status in (StepRunStatus.PENDING, StepRunStatus.RUNNING):
+            if step_run.status not in (StepRunStatus.PENDING, StepRunStatus.RUNNING):
+                continue
+            if not cancelled_steps and step_run.position == failed_step_position:
+                step_run.status = StepRunStatus.FAILED
+            else:
                 step_run.status = terminal
-                step_run.finished_at = utcnow()
+            step_run.finished_at = utcnow()
 
 
 def _apply_host_counters(execution: Execution, hosts: list[ExecutionHostRun]) -> None:
@@ -703,6 +751,108 @@ def execution_status(execution_id: int) -> ExecutionStatus | None:
         return execution.status if execution else None
     finally:
         session.close()
+
+
+# --------------------------------------------------------------------------- #
+# Cancellation
+# --------------------------------------------------------------------------- #
+
+_TERMINAL_STATUSES = (
+    ExecutionStatus.SUCCEEDED,
+    ExecutionStatus.FAILED,
+    ExecutionStatus.CANCELLED,
+)
+
+
+def request_cancel(
+    execution_id: int,
+    *,
+    reason: str,
+    requested_by_id: int | None,
+) -> tuple[bool, ExecutionStatus | None]:
+    """Record a cancellation request. Returns ``(recorded, status)``.
+
+    ``recorded`` is False when nothing was written, which happens in exactly two
+    cases: the execution does not exist (``status`` is then None), or it has
+    already finished. The latter is the completion/cancellation race -- the run won,
+    and pretending otherwise would rewrite a truthful outcome. The caller still
+    gets False rather than an error so a repeated or late click is harmless.
+
+    The timestamp is written before the runner is notified, so a cancellation that
+    the runner never observes (for example an execution whose task already ended)
+    is still visible in history instead of vanishing.
+    """
+    with _write_session() as session:
+        execution = session.get(Execution, execution_id)
+        if execution is None:
+            return False, None
+        if execution.status in _TERMINAL_STATUSES:
+            return False, execution.status
+        if execution.cancel_requested_at is not None:
+            # Idempotent: a second click keeps the first request's identity and
+            # time, so the audit trail shows one operator decision, not a burst of
+            # near-identical rows.
+            return False, execution.status
+        execution.cancel_requested_at = utcnow()
+        execution.cancel_requested_by_id = requested_by_id
+        execution.cancel_reason = (reason or "cancelled by request")[:120]
+        return True, execution.status
+
+
+def cancel_snapshot(execution_id: int) -> dict[str, object] | None:
+    """The cancellation fields for an execution, for read models."""
+    session = _session()
+    try:
+        execution = session.get(Execution, execution_id)
+        if execution is None:
+            return None
+        return {
+            "cancel_requested_at": execution.cancel_requested_at,
+            "cancel_requested_by_id": execution.cancel_requested_by_id,
+            "cancel_reason": execution.cancel_reason,
+        }
+    finally:
+        session.close()
+
+
+def settle_unowned_cancel(execution_id: int, *, reason: str) -> bool:
+    """Finish a run nobody is executing any more as cancelled.
+
+    Needed because cancellation is cooperative: the runner can only stop a task it
+    owns. After a restart, or for a row whose task ended without settling, the
+    request would otherwise sit on a row that stays RUNNING forever -- visible as a
+    run that can never finish and never be cancelled again.
+
+    The caller must establish that no live task owns the execution; this function
+    cannot know that on its own.
+    """
+    with _write_session() as session:
+        execution = session.get(Execution, execution_id)
+        if execution is None or execution.status in _TERMINAL_STATUSES:
+            return False
+        now = utcnow()
+        hosts = session.scalars(
+            select(ExecutionHostRun).where(
+                ExecutionHostRun.execution_id == execution_id
+            )
+        ).all()
+        for host in hosts:
+            if host.status in (HostRunStatus.PENDING, HostRunStatus.RUNNING):
+                host.status = HostRunStatus.CANCELLED
+                host.error_message = f"Execution cancelled ({reason})."
+                host.finished_at = now
+            for step_run in host.step_runs:
+                if step_run.status in (StepRunStatus.PENDING, StepRunStatus.RUNNING):
+                    step_run.status = StepRunStatus.CANCELLED
+                    step_run.finished_at = now
+        _apply_host_counters(execution, list(hosts))
+        execution.status = ExecutionStatus.CANCELLED
+        execution.error_message = reason
+        execution.finished_at = now
+        if execution.cancel_requested_at is None:
+            execution.cancel_requested_at = now
+            execution.cancel_reason = reason[:120]
+        return True
 
 
 def record_discovery(
@@ -820,6 +970,36 @@ def load_run_as_passwords(execution_id: int) -> dict[int, str]:
                     block.password_encrypted
                 ).decode("utf-8")
         return passwords
+    finally:
+        session.close()
+
+
+def load_primary_sudo_password(credential_id: int) -> str | None:
+    """Decrypt the sudo password stored for the SSH account behind a credential.
+
+    Keyed on the credential's *owner*, not on whoever triggered the execution: the
+    sudo password authenticates the remote account that ``sudo`` runs as, and that
+    account belongs to the credential. Using the runner's identity would pick up a
+    password for a different remote user and fail confusingly.
+
+    Returns None when unset, which is not an error -- passwordless sudo and
+    ``NOPASSWD`` hosts legitimately have no password here.
+    """
+    from app.core.security import decrypt_secret
+    from app.models.credential import SshCredential
+    from app.models.profile import UserSshSecret
+
+    session = _session()
+    try:
+        credential = session.get(SshCredential, credential_id)
+        if credential is None:
+            return None
+        secrets_row = session.scalars(
+            select(UserSshSecret).where(UserSshSecret.user_id == credential.owner_id)
+        ).first()
+        if secrets_row is None or not secrets_row.sudo_password_encrypted:
+            return None
+        return decrypt_secret(secrets_row.sudo_password_encrypted).decode("utf-8")
     finally:
         session.close()
 

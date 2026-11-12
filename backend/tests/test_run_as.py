@@ -18,6 +18,12 @@ from tests import lab_support
 
 lab = lab_support.lab_marker
 
+# Module-level so ``SSHSUITE_REQUIRE_LAB=1`` fails instead of silently skipping when
+# the lab is down. This also gates the unit half above, which does not itself need
+# the lab; the tradeoff is deliberate -- one marker keeps the whole module's lab
+# dependency visible, and the hook has no effect while the lab is reachable.
+pytestmark = lab
+
 # Credentials seeded into the lab image (testlab/Dockerfile).
 LAB_SUDO_PASSWORD = "LabSudoPassword1"
 LAB_NOPASSWD_TARGET = "deploy"

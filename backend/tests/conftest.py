@@ -287,6 +287,12 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+# Set by ``pytest_collection_modifyitems`` when the lab is missing but required.
+# The setup hook below reads it so availability is probed once per session rather
+# than once per test.
+_LAB_MISSING: pytest.StashKey[str] = pytest.StashKey()
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip real-SSH tests when the lab is down, unless CI requires it.
 
@@ -302,10 +308,27 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         "SSH test lab not reachable on 127.0.0.1:2201. Start it with: "
         "cd testlab && docker compose -f docker-compose.yml -f compose.loopback.yml up -d"
     )
+    if require:
+        # pytest has no marker that fails an item; ``pytest.mark.fail`` is not a
+        # real marker and silently does nothing. Record the decision here and let
+        # ``pytest_runtest_setup`` fail the affected tests.
+        config.stash[_LAB_MISSING] = message
+        return
     for item in items:
         if "lab" not in item.keywords:
             continue
-        if require:
-            item.add_marker(pytest.mark.fail(reason=message))
-        else:
-            item.add_marker(pytest.mark.skip(reason=message))
+        item.add_marker(pytest.mark.skip(reason=message))
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Fail lab-marked tests outright when the lab is missing but required.
+
+    ``tryfirst`` matters: it has to run before an injected skip marker or a
+    fixture that skips on its own availability check (``test_run_as.lab_env``),
+    otherwise the test would still report as skipped.
+    """
+    message = item.config.stash.get(_LAB_MISSING, None)
+    if message is None or "lab" not in item.keywords:
+        return
+    pytest.fail(message, pytrace=False)

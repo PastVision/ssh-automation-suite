@@ -253,3 +253,81 @@ def test_the_aggregate_is_one_query_regardless_of_workflow_count(migrated_db):
     # One grouped aggregate is the point; a correlated subquery would reintroduce
     # the per-row cost inside a single statement.
     assert "group by" in selects[0].lower()
+
+
+# --------------------------------------------------------------------------- #
+# active_execution_count (QA-002)
+# --------------------------------------------------------------------------- #
+
+
+def _launch(workflow_id: int) -> int:
+    """Start a real execution without a runner, so no SSH is involved.
+
+    ``launch`` is the same entry point the API uses; only the background run is
+    suppressed. The row it leaves behind is PENDING, which is exactly what a
+    freshly launched execution looks like to the list query.
+    """
+    from app.services import sessions, workflows
+
+    owner = sessions.get_user_by_username("alice")
+    assert owner is not None
+    issued = sessions.create_session(owner.id, user_agent="test", remote_addr=None)
+    principal = sessions.Principal(
+        user_id=owner.id,
+        username="alice",
+        display_name="alice",
+        source="test",
+        session_id=issued.session_id,
+    )
+    return workflows.launch(workflow_id, principal=principal, start_runner=False)
+
+
+def _count_for(client: TestClient, token: str, workflow_id: int) -> int:
+    response = client.get("/api/workflows", headers=csrf(token))
+    assert response.status_code == 200, response.text
+    listed = {item["id"]: item for item in response.json()["items"]}
+    return listed[workflow_id]["active_execution_count"]
+
+
+def test_active_count_tracks_the_lifecycle_of_a_run(
+    app_client: TestClient, users, alice
+) -> None:
+    """The badge has to be right while a run is live and after it ends.
+
+    Three states matter and all three are asserted here: a run in flight counts,
+    a finished run does not, and a cancelled run does not either. The cancellation
+    case is the one likely to drift -- a row settled as cancelled could easily be
+    left looking active if the terminal set were incomplete.
+    """
+    from app.models.enums import ExecutionStatus
+    from app.services import execution_state
+
+    client, token = alice
+    workflow_id = _workflow(
+        client, token, credential_id=_credential(users["alice"]), name="nightly"
+    )
+
+    assert _count_for(client, token, workflow_id) == 0
+
+    execution_id = _launch(workflow_id)
+    assert _count_for(client, token, workflow_id) == 1
+
+    execution_state.mark_execution_running(execution_id)
+    assert _count_for(client, token, workflow_id) == 1
+
+    execution_state.finish_execution(
+        execution_id, status=ExecutionStatus.SUCCEEDED
+    )
+    assert _count_for(client, token, workflow_id) == 0
+
+    cancelled_id = _launch(workflow_id)
+    assert _count_for(client, token, workflow_id) == 1
+
+    assert execution_state.request_cancel(
+        cancelled_id, reason="operator cancelled", requested_by_id=users["alice"]
+    ) == (True, ExecutionStatus.PENDING)
+    assert execution_state.settle_unowned_cancel(
+        cancelled_id, reason="operator cancelled"
+    )
+    assert execution_state.get_execution(cancelled_id).status is ExecutionStatus.CANCELLED
+    assert _count_for(client, token, workflow_id) == 0

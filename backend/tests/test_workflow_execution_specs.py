@@ -480,3 +480,66 @@ def test_launch_refuses_when_the_block_holds_no_password(
         workflows.build_execution_specs(_load(workflow_id))
 
     assert "no stored password" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# Live template resolution at launch (QA-007)
+# --------------------------------------------------------------------------- #
+
+
+def test_launch_runs_the_newest_template_body_without_resaving_the_workflow(
+    alice: Principal, credential_id: int
+) -> None:
+    """Editing a template must reach the next run of an already-saved workflow.
+
+    The workflow is created while the template is at body A, then the template is
+    edited to body B, and the workflow is launched *without* being saved again. A
+    workflow that pinned a version number at save time would still run A here; the
+    snapshot is taken at launch, so B is what executes.
+
+    This drives the real ``launch`` entry point rather than asserting on a
+    hand-built snapshot: the defect this guards against lives in the spec-building
+    path, and a manually constructed expectation would bypass it entirely.
+    ``start_runner=False`` keeps SSH out of it while still using the one
+    execution-construction path manual and scheduled runs share.
+    """
+    from app.models.permission import ResourceType
+    from app.services import execution_state, templates
+    from tests.test_workflows import _take_lock_for
+
+    template_id = _make_template(alice, "deploy", ["echo body-a\n"])
+    workflow_id = _created(alice, credential_id, template_ids=[template_id])
+
+    _take_lock_for(alice, ResourceType.TEMPLATE, template_id)
+    templates.update(
+        template_id,
+        templates.TemplateBody(
+            name="deploy",
+            description=None,
+            steps=(templates.StepData(name="deploy-1", script="echo body-b\n"),),
+        ),
+        expected_row_version=None,
+        principal=alice,
+    )
+
+    execution_id = workflows.launch(workflow_id, principal=alice, start_runner=False)
+
+    steps = execution_state.load_steps(execution_id)
+    assert [step.script for step in steps] == ["echo body-b\n"]
+
+    # The run keeps what it started with: a later edit cannot rewrite history.
+    _take_lock_for(alice, ResourceType.TEMPLATE, template_id)
+    templates.update(
+        template_id,
+        templates.TemplateBody(
+            name="deploy",
+            description=None,
+            steps=(templates.StepData(name="deploy-1", script="echo body-c\n"),),
+        ),
+        expected_row_version=None,
+        principal=alice,
+    )
+
+    assert [step.script for step in execution_state.load_steps(execution_id)] == [
+        "echo body-b\n"
+    ]

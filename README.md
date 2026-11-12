@@ -4,11 +4,12 @@ Run reusable shell-script templates over SSH across many hosts, from a small
 self-hosted web UI. No Redis, no Celery, no Kubernetes — one FastAPI process, a
 SQLite file, and logs on disk.
 
-> **Status: Milestones 1–3 and 6 complete.**
-> Credentials, versioned templates, workflows, the SSH execution engine and
-> end-to-end workflow authoring in the browser all work against the local Docker
-> SSH lab. Still missing: WebSocket log streaming (the UI polls over HTTP) and
-> APScheduler-based scheduling. See [Roadmap](#roadmap).
+> **Status: Milestones 1-3, 5 and 6 complete; milestone 4 partial.**
+> Credentials, versioned templates, workflows, the SSH execution engine,
+> end-to-end workflow authoring in the browser and APScheduler-based scheduling
+> all work against the local Docker SSH lab. Scheduling has an API and no screen
+> yet. Still missing: WebSocket log streaming (the UI polls over HTTP). See
+> [Roadmap](#roadmap) for what each milestone covers.
 
 ---
 
@@ -471,6 +472,7 @@ isolation, the global concurrency ceiling, cancellation, and shutdown.
 | 4 (partial) | Execution history UI and filesystem log viewer: **done**. WebSocket log streaming: **not implemented**, the UI polls over HTTP |
 | **5 (done)** | APScheduler scheduling: one-time and recurring schedules, firing ledger, misfire policy, lease-based single dispatcher, bounded catch-up. Schedules API only; no scheduling UI yet |
 | **6 (done)** | End-to-end workflow authoring in the UI: editor, host list, variables, run monitor, execution detail |
+| **7 (done)** | Scheduled execution reliability: overlap control, orphaned-run reconciliation after a crash, scheduler status on the dashboard, lab coverage for a scheduled firing |
 
 ---
 

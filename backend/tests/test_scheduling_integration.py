@@ -12,6 +12,7 @@ Everything here opens a real SSH connection to the Docker test lab.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -20,7 +21,7 @@ from app.db.types import as_utc
 from app.models.enums import ExecutionStatus, ExecutionTrigger, HostRunStatus
 from app.models.schedule import MisfirePolicy, ScheduleKind, ScheduleRunOutcome
 from app.services import dispatch, execution_state, schedules, templates, workflows
-from app.services.execution_runner import CancelToken, ExecutionRunner, reset_runner
+from app.services.execution_runner import get_runner, reset_runner
 from app.services.lease import SchedulerLease
 from app.services.sessions import Principal, create_session
 from tests import lab_support as lab
@@ -29,12 +30,22 @@ pytestmark = pytest.mark.lab
 
 
 @pytest.fixture()
-def lab_env(settings, migrated_db, monkeypatch):
-    """Point the SSH stack at the lab and return a usable credential."""
-    resolved = lab.configure_lab_settings(monkeypatch)
-    credential_id = lab.create_lab_credential(resolved)
-    reset_runner()
-    yield resolved, credential_id
+def lab_credential(settings, migrated_db, monkeypatch):
+    """Resolver: a lab credential owned by the user who asks for one.
+
+    Ownership is enforced, so the credential has to belong to the same account
+    that creates the workflow; a fixture built for one user cannot be reused by
+    another.
+    """
+
+    def _make(username: str) -> tuple[Principal, int]:
+        resolved = lab.configure_lab_settings(monkeypatch)
+        owner = _owner(username)
+        credential_id = lab.create_lab_credential(resolved, owner_id=owner.user_id)
+        reset_runner()
+        return owner, credential_id
+
+    yield _make
     reset_runner()
 
 
@@ -125,10 +136,10 @@ def _due_instant(schedule_id: int):
 
 
 def test_a_scheduled_firing_produces_a_runnable_execution(
-    lab_env, settings, migrated_db
+    lab_credential, settings, migrated_db
 ) -> None:
-    resolved, credential_id = lab_env
-    owner = _owner("scheduled-lab")
+    """A firing must yield an execution the real runner can actually carry out."""
+    owner, credential_id = lab_credential("scheduled-lab")
     marker = f"scheduled-run-{owner.user_id}"
     workflow_id = _workflow(owner, credential_id, marker=marker)
     schedule_id = _cron_schedule(owner, workflow_id)
@@ -137,7 +148,20 @@ def test_a_scheduled_firing_produces_a_runnable_execution(
     assert lease.acquire().held
 
     firing = _due_instant(schedule_id)
-    result = dispatch.dispatch(schedule_id, firing, lease=lease)
+
+    async def _fire():
+        # dispatch() hands the execution to a background task, which needs a
+        # running loop exactly as the server provides one. Wait for that task to
+        # finish so the test observes the completed run instead of racing it.
+        result = dispatch.dispatch(schedule_id, firing, lease=lease)
+        if result.detail:
+            raise AssertionError(result.detail)
+        runner = get_runner()
+        while result.execution_id in runner.active_execution_ids():
+            await asyncio.sleep(0.05)
+        return result
+
+    result = lab.run(_fire())
     assert result.outcome is ScheduleRunOutcome.DISPATCHED, result.detail
 
     execution = execution_state.get_execution(result.execution_id)
@@ -151,9 +175,8 @@ def test_a_scheduled_firing_produces_a_runnable_execution(
     assert [step.script.strip() for step in steps] == [f"echo {marker}"]
     assert execution_state.load_host_specs(execution.id)
 
-    # Drive the real SSH path on the execution the firing created.
-    lab.run(ExecutionRunner(settings)._run_execution(execution.id, CancelToken()))
-
+    # The runner that dispatch started has already finished by the time _fire
+    # returns; nothing else touches the execution here.
     finished = execution_state.get_execution(execution.id)
     assert finished is not None
     assert finished.status is ExecutionStatus.SUCCEEDED, finished.error_message
@@ -170,11 +193,10 @@ def test_a_scheduled_firing_produces_a_runnable_execution(
 
 
 def test_a_crashed_scheduled_run_recovers_with_real_host_rows(
-    lab_env, parked_runner, settings, migrated_db
+    lab_credential, parked_runner, settings, migrated_db
 ) -> None:
     """Reconciliation must unblock a schedule whose host rows really exist."""
-    resolved, credential_id = lab_env
-    owner = _owner("scheduled-lab-recovery")
+    owner, credential_id = lab_credential("scheduled-lab-recovery")
     workflow_id = _workflow(owner, credential_id, marker="recovery")
     schedule_id = _cron_schedule(owner, workflow_id)
 

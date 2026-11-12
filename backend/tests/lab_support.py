@@ -64,6 +64,26 @@ def read_lab_key() -> str:
     return LAB_KEY.read_text(encoding="utf-8")
 
 
+def read_or_generate_key() -> str:
+    """The lab key when present, else a throwaway key that opens no connection.
+
+    Many scheduling and workflow tests need a *credential row* but never dial
+    SSH. Requiring the lab key for those made a fresh clone error during fixture
+    setup instead of running, even though ``keys/`` is deliberately uncommitted.
+    """
+    if LAB_KEY.exists():
+        return read_lab_key()
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+
+
 def configure_lab_settings(monkeypatch: pytest.MonkeyPatch):
     """Point the app at the lab and return the resolved settings.
 
@@ -115,7 +135,7 @@ def create_lab_credential(settings, owner_id: int | None = None) -> int:
         )
         session.add(record)
         session.flush()
-        info = key_store.store_private_key(record.id, read_lab_key(), settings=settings)
+        info = key_store.store_private_key(record.id, read_or_generate_key(), settings=settings)
         record.private_key_path = info.path
         record.private_key_fingerprint = info.fingerprint
         record.private_key_type = info.key_type
